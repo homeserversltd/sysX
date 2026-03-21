@@ -5,7 +5,7 @@
 //!   sysxc forge-core <output.bin> <admin_gid>
 
 use std::env;
-use sysx_compiler::{compile_service, forge_core_bin, CompilerError};
+use sysx_compiler::{compile_service, forge_core_bin};
 
 fn main() {
     let args: Vec<String> = env::args().collect();

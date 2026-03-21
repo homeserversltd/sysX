@@ -6,10 +6,13 @@ description = "SysX CLI for controlling the cgroup supervisor via binary IPC"
 authors = ["HOMESERVER LLC"]
 license = "AGPL-3.0"
 repository = "https://github.com/homeserverllc/sysX"
+autobins = false
+
+[[bin]]
+name = "sysx"
+path = "src/main.rs"
 
 [dependencies]
 sysx-ipc = { path = "../sysx-ipc" }
-clap = { version = "4.5", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
-serde_json = "1.0"
-thiserror = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+bytes = "1"

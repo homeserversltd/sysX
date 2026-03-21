@@ -39,14 +39,14 @@ fn run() -> Result<(), SysXError> {
     );
 
     // Phase 1: Boot sequence per 04-runtime-reaper-and-sweep-guarantee.md and 17-sealed-boot-core-bin.md
-    sysxd::boot::initialize(&start)?;
+    let control = sysxd::boot::initialize(&start)?;
 
     // Phase 2: Pre-reactor DAG validation (Kahn topological sort, cycle detection, max depth 16)
     let schemas = load_schemas()?;
     sysxd::dag::validate(&schemas)?;
 
-    // Phase 3: Main reactor wiring
-    sysxd::reactor::run()?;
+    // Phase 3: Main reactor wiring (control socket listener from boot)
+    sysxd::reactor::run(control)?;
 
     info!("sysxd shutdown complete");
     Ok(())

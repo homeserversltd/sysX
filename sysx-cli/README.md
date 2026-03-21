@@ -1,16 +1,13 @@
 # sysx-cli
 
-Command line interface for SysX cgroup supervisor.
+Binary client for **`12-canonical-spec-v1.md` §2** (same framing as `sysx-ipc`).
 
-Speaks the binary IPC wire format from 12-canonical-spec-v1.md §2 to /run/sysx/control.sock.
+Build: `cargo build -p sysx-cli --bin sysx` → `target/debug/sysx`.
 
-Maps outcome bytes (§2.1) vs Status ABI (§2.1.1) correctly based on command sent.
+```text
+sysx --socket /run/sysx/control.sock status <service>
+sysx start <service> | stop <service> | reset <service>
+sysx poweroff | reboot
+```
 
-Usage:
-  sysx start <service>
-  sysx stop <service>
-  sysx status <service>
-  sysx poweroff
-  sysx reboot
-
-See docs/memories/ongoing/sysX/ for wire protocol details.
+`SYSX_SOCKET` overrides the default path. Requires **`sysxd`** listening on that socket (PID 1 or dev run).

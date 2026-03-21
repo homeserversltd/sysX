@@ -3,7 +3,7 @@
 //! Enforces max depth 16, cycle detection, and strict schema validation
 //! before reactor ignition per 12-canonical-spec-v1.md and 16-recovery-dag.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use log::info;
 use sysx_schema::ServiceSchema;
 use crate::SysXError;

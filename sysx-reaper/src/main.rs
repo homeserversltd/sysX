@@ -3,7 +3,6 @@
 //! Entry point for the cgroup.events epoll monitor and sweep coordinator.
 //! Implements the epoll side of the stop ladder per 12-canonical-spec-v1.md §4.1.1.
 
-use std::env;
 use sysx_reaper::Reaper;
 use log::{info, error};
 

@@ -6,12 +6,11 @@ Implements the binary framing, command space (0x10-0x60), SO_PEERCRED contract, 
 
 ## Features
 
-- Fixed 16-byte header with `SYSX` magic
-- Command enum covering 0x10-0x60 range
+- Fixed 16-byte header: `SYSX`, version, **§2 command**, **`u16` payload length LE**, 8 reserved bytes
+- Command enum: **`0x10` Start, `0x20` Stop, `0x30` Status, `0x40` Reset, `0x50` Poweroff, `0x60` Reboot** only
 - Strict payload size enforcement (4096 bytes max)
 - SO_PEERCRED peer validation helpers
 - CoreConfig carrying `epoll_timeout_ms`
-- Zero-dependency core (optional tokio for async)
 
 ## Usage
 
@@ -33,8 +32,5 @@ let frame = msg.encode();
 - SO_PEERCRED validation on control socket accept
 - Clean error types with `thiserror`
 
-This crate is **only** to be used by other sysX crates. No other crates were created or modified per the batch directive.
+This crate is **only** for other sysX crates.
 
----
-
-**Created by ornias per Asmodeus batch directive.**
