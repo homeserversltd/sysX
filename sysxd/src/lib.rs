@@ -7,6 +7,7 @@ use thiserror::Error;
 pub mod boot;
 pub mod dag;
 pub mod reactor;
+pub mod terminal_broadcast;
 
 pub use boot::BootState;
 pub use boot::initialize as boot_initialize;

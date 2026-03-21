@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixListener;
+
 use std::str;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,12 @@ use sysx_ipc::{
 use sysx_runtime::{
     read_sysfs_cgroup_populated, validate_ipc_service_name, RuntimeContext,
 };
+
+use crate::terminal_broadcast::{
+    run_terminal_broadcast, TerminalBroadcastKind,
+};
+#[cfg(target_os = "linux")]
+use crate::terminal_broadcast::{on_sigpwr_signalfd, register_sigpwr_signalfd};
 
 use crate::SysXError;
 
@@ -59,6 +66,31 @@ pub fn run(
         .add(&listener, listen_ev)
         .map_err(|e| SysXError::Reactor(format!("epoll add listener: {}", e)))?;
     let mut listener_in_epoll = true;
+
+    #[cfg(target_os = "linux")]
+    let sigpwr: Option<nix::sys::signalfd::SignalFd> = match register_sigpwr_signalfd() {
+        Ok(sfd) => {
+            info!("SIGPWR signalfd registered for epoll (12 §9.1)");
+            Some(sfd)
+        }
+        Err(e) => {
+            warn!("SIGPWR signalfd unavailable: {} — ACPI power path disabled", e);
+            None
+        }
+    };
+
+    #[cfg(target_os = "linux")]
+    let signalfd_raw: Option<RawFd> = sigpwr.as_ref().map(|s| s.as_raw_fd());
+    #[cfg(not(target_os = "linux"))]
+    let signalfd_raw: Option<RawFd> = None;
+
+    #[cfg(target_os = "linux")]
+    if let Some(ref sfd) = sigpwr {
+        let ev = EpollEvent::new(EpollFlags::EPOLLIN, sfd.as_raw_fd() as u64);
+        epoll.add(sfd, ev).map_err(|e| {
+            SysXError::Reactor(format!("epoll add SIGPWR signalfd: {}", e))
+        })?;
+    }
 
     let epoll_ms = u32::from(sealed.epoll_timeout_ms);
     let epoll_timeout = EpollTimeout::try_from(epoll_ms).map_err(|e| {
@@ -107,6 +139,11 @@ pub fn run(
                             &mut clients,
                             sealed,
                         )?;
+                    } else if signalfd_raw == Some(fd) {
+                        #[cfg(target_os = "linux")]
+                        if let Some(ref sfd) = sigpwr {
+                            on_sigpwr_signalfd(sfd, rt);
+                        }
                     } else {
                         on_client_readable(
                             &epoll,
@@ -458,11 +495,21 @@ fn dispatch_ipc(
                 reply_pre_dispatch_error(sock, OUTCOME_WIRE_PARSE, REASON_NA);
                 return;
             }
-            info!("Terminal broadcast command {:?} (TODO §9.1)", hdr.command);
+            let (kind, ipc_tag) = if hdr.command == Command::Poweroff {
+                (TerminalBroadcastKind::Poweroff, "ipc-0x50")
+            } else {
+                (TerminalBroadcastKind::Reboot, "ipc-0x60")
+            };
+            info!(
+                "Terminal Broadcast IPC {:?} — reply then §9.1 sequence (trigger={})",
+                hdr.command, ipc_tag
+            );
             let out = encode_ipc_reply(hdr.command, OUTCOME_SUCCESS, REASON_NA);
             if let Err(e) = sock.write_all(&out) {
                 error!("reply write failed: {}", e);
+                return;
             }
+            run_terminal_broadcast(rt, kind, ipc_tag);
         }
         Command::Reset => {
             if hdr.payload_length == 0 || plen == 0 {

@@ -191,7 +191,11 @@ pub const OUTCOME_SUCCESS: u8 = 0x00;
 pub const OUTCOME_UNAUTHORIZED: u8 = 0x02;
 /// §2.1 **`0x03`** — wire-level parse / pre-dispatch frame rejection (`12` §2.1).
 pub const OUTCOME_WIRE_PARSE: u8 = 0x03;
+/// §2.1 **`0x04`** — epistemic conflict / physical denial (e.g. **`Start`** blocked by **`max_cgroups`**, `12` §2.2).
+pub const OUTCOME_EPISTEMIC_CONFLICT: u8 = 0x04;
 pub const REASON_NA: u8 = 0x00;
+/// §2.1 **`reason_code`** **`0x06`** — cgroup capacity (**`max_cgroups`** from **`core.bin`**) with **`status_code`** **`0x04`** (`12` §2.2).
+pub const REASON_CGROUP_CAPACITY: u8 = 0x06;
 
 /// §2.1.1 Status primary states (`byte0`).
 pub const STATUS_OFFLINE: u8 = 0x00;
