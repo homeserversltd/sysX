@@ -6,6 +6,7 @@ description = "SysX YAML to ServiceSchema compiler and core.bin forger per 15-sc
 license = "MIT"
 
 [dependencies]
+sysx-ipc = { path = "../sysx-ipc" }
 sysx-schema = { path = "../sysx-schema" }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"

@@ -25,7 +25,7 @@ fn main() {
             }
             match compile_service(&args[2]) {
                 Ok(schema) => {
-                    println!("✓ Compiled schema for service: {}", schema.service.name);
+                    println!("OK: compiled schema for service: {}", schema.service.name);
                     println!("  enabled: {}", schema.enabled);
                     println!("  exec: {}", schema.service.exec);
                     Ok(())
@@ -41,7 +41,7 @@ fn main() {
             let admin_gid = args[3].parse::<u32>().unwrap_or(1000);
             match forge_core_bin(&args[2], admin_gid) {
                 Ok(_) => {
-                    println!("✓ Forged 32-byte SysxCoreConfig to {}", args[2]);
+                    println!("OK: forged 32-byte core.bin to {}", args[2]);
                     Ok(())
                 }
                 Err(e) => Err(e),

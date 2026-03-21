@@ -8,6 +8,7 @@ pub mod boot;
 pub mod dag;
 pub mod reactor;
 
+pub use boot::BootState;
 pub use boot::initialize as boot_initialize;
 pub use dag::validate as validate_dag;
 pub use reactor::run as run_reactor;

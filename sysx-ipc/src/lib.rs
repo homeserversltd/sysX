@@ -22,6 +22,65 @@ pub const MAX_PAYLOAD_BYTES: usize = 4096;
 /// Maximum concurrent FDs allowed on control socket
 pub const MAX_CONCURRENT_FDS: usize = 64;
 
+// --- Sealed `/etc/sysx/core.bin` (17-sysx-sealed-boot-core-bin.md §4, 12 §2.2) ---
+
+/// Fixed file size for `SysxCoreConfig` on disk.
+pub const CORE_BIN_SIZE: usize = 32;
+
+/// Sealed core magic (`"SYSX"`).
+pub const CORE_BIN_MAGIC: &[u8; 4] = b"SYSX";
+
+/// `core.bin` format version (must match forge and PID 1 decode).
+pub const CORE_BIN_VERSION: u8 = 1;
+
+/// Runtime policy from sealed `core.bin` (numeric fields only; no heap parse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SysxCoreBin {
+    pub admin_gid: u32,
+    pub max_cgroups: u32,
+    pub epoll_timeout_ms: u16,
+}
+
+/// `core.bin` validation / decode errors (PID 1 must fail closed).
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum CoreBinError {
+    #[error("core.bin: expected {CORE_BIN_SIZE} bytes, got {0}")]
+    BadSize(usize),
+    #[error("core.bin: bad magic (expected SYSX)")]
+    BadMagic,
+    #[error("core.bin: unsupported version {0}")]
+    BadVersion(u8),
+}
+
+/// Decode 32-byte sealed artifact from disk (`17` §4, little-endian multi-byte fields).
+pub fn decode_core_bin(data: &[u8]) -> Result<SysxCoreBin, CoreBinError> {
+    if data.len() != CORE_BIN_SIZE {
+        return Err(CoreBinError::BadSize(data.len()));
+    }
+    if data[0..4] != CORE_BIN_MAGIC[..] {
+        return Err(CoreBinError::BadMagic);
+    }
+    if data[4] != CORE_BIN_VERSION {
+        return Err(CoreBinError::BadVersion(data[4]));
+    }
+    Ok(SysxCoreBin {
+        admin_gid: u32::from_le_bytes([data[5], data[6], data[7], data[8]]),
+        max_cgroups: u32::from_le_bytes([data[9], data[10], data[11], data[12]]),
+        epoll_timeout_ms: u16::from_le_bytes([data[13], data[14]]),
+    })
+}
+
+/// Encode canonical 32-byte `core.bin` (forge-time / tests). Reserved tail is zeroed.
+pub fn encode_core_bin(admin_gid: u32, max_cgroups: u32, epoll_timeout_ms: u16) -> [u8; CORE_BIN_SIZE] {
+    let mut b = [0u8; CORE_BIN_SIZE];
+    b[0..4].copy_from_slice(CORE_BIN_MAGIC);
+    b[4] = CORE_BIN_VERSION;
+    b[5..9].copy_from_slice(&admin_gid.to_le_bytes());
+    b[9..13].copy_from_slice(&max_cgroups.to_le_bytes());
+    b[13..15].copy_from_slice(&epoll_timeout_ms.to_le_bytes());
+    b
+}
+
 /// Command opcodes — **`12-canonical-spec-v1.md` §2** (v1.4 wire; no other values on the wire).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -199,7 +258,7 @@ impl Message {
     }
 }
 
-/// SO_PEERCRED based peer validation contract
+/// SO_PEERCRED read (before trusting bytes). Pair with [`peer_allowed_control`].
 pub fn validate_peer_credentials(fd: RawFd) -> Result<UnixCredentials, FrameError> {
     // SO_PEERCRED via getsockopt (nix 0.29 expects AsFd — use BorrowedFd::borrow_raw)
     unsafe {
@@ -209,10 +268,14 @@ pub fn validate_peer_credentials(fd: RawFd) -> Result<UnixCredentials, FrameErro
     }
 }
 
-/// Configuration type that carries epoll_timeout_ms from core.bin
+/// Operator policy (`14` §4, `17` §5): **`uid == 0`** or **`gid == admin_gid`** from sealed `core.bin`.
+pub fn peer_allowed_control(creds: &UnixCredentials, admin_gid: u32) -> bool {
+    creds.uid() == 0 || creds.gid() as u32 == admin_gid
+}
+
+/// Spec constants not stored in `core.bin` (12 §2.2); kept for helpers / docs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreConfig {
-    pub epoll_timeout_ms: u32,
     pub max_payload_bytes: usize,
     pub max_concurrent_fds: usize,
 }
@@ -220,7 +283,6 @@ pub struct CoreConfig {
 impl Default for CoreConfig {
     fn default() -> Self {
         Self {
-            epoll_timeout_ms: 5000,
             max_payload_bytes: MAX_PAYLOAD_BYTES,
             max_concurrent_fds: MAX_CONCURRENT_FDS,
         }
@@ -257,5 +319,22 @@ mod tests {
         let (h, pl) = decode_frame(&b).expect("reply decode");
         assert_eq!(h.command, Command::Status);
         assert_eq!(pl, &[0x02, 0x00]);
+    }
+
+    #[test]
+    fn core_bin_roundtrip_17() {
+        let raw = encode_core_bin(1000, 256, 100);
+        let c = decode_core_bin(&raw).expect("decode");
+        assert_eq!(c.admin_gid, 1000);
+        assert_eq!(c.max_cgroups, 256);
+        assert_eq!(c.epoll_timeout_ms, 100);
+        assert_eq!(raw.len(), CORE_BIN_SIZE);
+    }
+
+    #[test]
+    fn core_bin_rejects_wrong_magic() {
+        let mut raw = encode_core_bin(1, 2, 3);
+        raw[0] = b'X';
+        assert_eq!(decode_core_bin(&raw), Err(super::CoreBinError::BadMagic));
     }
 }

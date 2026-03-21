@@ -1,10 +1,11 @@
 //! SysX Compiler
 //!
-//! Compiles service YAML to ServiceSchema and forges the 32-byte SysxCoreConfig
-//! sealed boot artifact per 17-sysx-sealed-boot-core-bin.md §4 and 15-schema-contract.
+//! Compiles service YAML to ServiceSchema and forges the 32-byte sealed boot artifact
+//! per `17-sysx-sealed-boot-core-bin.md` §4 and `15-schema-contract-v1.md`.
 
 use std::fs;
-use sysx_schema::{ServiceSchema, from_yaml_strict, SchemaError};
+use sysx_ipc::encode_core_bin;
+use sysx_schema::{from_yaml_strict, SchemaError, ServiceSchema};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -17,56 +18,32 @@ pub enum CompilerError {
     Forge(String),
 }
 
-/// 32-byte SysxCoreConfig sealed at forge time (per 17 §4)
-#[derive(Debug, Clone)]
-pub struct SysxCoreConfig {
-    pub admin_gid: u32,
-    pub watchdog_timeout_ms: u32,
-    pub max_payload_bytes: u32,
-    pub max_concurrent_fds: u16,
-    pub epoll_timeout_ms: u16,
-    pub schema_version: u8,
-    // 32-byte fixed size padding/reserved
-    _padding: [u8; 7],
+/// Default supervised cgroup capacity when forge CLI does not pass overrides (`12` §2.2).
+pub const DEFAULT_MAX_CGROUPS: u32 = 256;
+
+/// Default `epoll_wait` timeout for IPC frame assembly (milliseconds, `12` §2.2).
+pub const DEFAULT_EPOLL_TIMEOUT_MS: u16 = 100;
+
+/// Forge sealed `core.bin` for PID 1 bootstrap (canonical `17` §4 layout via `sysx-ipc`).
+pub fn forge_core_bin(output_path: &str, admin_gid: u32) -> Result<(), CompilerError> {
+    forge_core_bin_full(
+        output_path,
+        admin_gid,
+        DEFAULT_MAX_CGROUPS,
+        DEFAULT_EPOLL_TIMEOUT_MS,
+    )
 }
 
-impl SysxCoreConfig {
-    pub fn new(admin_gid: u32) -> Self {
-        Self {
-            admin_gid,
-            watchdog_timeout_ms: 10000,
-            max_payload_bytes: 4096,
-            max_concurrent_fds: 64,
-            epoll_timeout_ms: 100,
-            schema_version: 1,
-            _padding: [0; 7],
-        }
-    }
-
-    /// Forge core.bin (32-byte binary artifact)
-    pub fn forge(&self, path: &str) -> Result<(), CompilerError> {
-        let mut buf = Vec::with_capacity(32);
-
-        // Pack into 32 bytes (simple layout for PID1 zero-allocation read)
-        buf.extend_from_slice(&self.admin_gid.to_le_bytes());
-        buf.extend_from_slice(&self.watchdog_timeout_ms.to_le_bytes());
-        buf.extend_from_slice(&self.max_payload_bytes.to_le_bytes());
-        buf.extend_from_slice(&self.max_concurrent_fds.to_le_bytes());
-        buf.extend_from_slice(&self.epoll_timeout_ms.to_le_bytes());
-        buf.push(self.schema_version);
-        buf.extend_from_slice(&self._padding);
-
-        // Ensure exactly 32 bytes
-        while buf.len() < 32 {
-            buf.push(0);
-        }
-        if buf.len() > 32 {
-            buf.truncate(32);
-        }
-
-        fs::write(path, &buf)?;
-        Ok(())
-    }
+/// Full forge with explicit reactor fields (`12` §2.2).
+pub fn forge_core_bin_full(
+    output_path: &str,
+    admin_gid: u32,
+    max_cgroups: u32,
+    epoll_timeout_ms: u16,
+) -> Result<(), CompilerError> {
+    let raw = encode_core_bin(admin_gid, max_cgroups, epoll_timeout_ms);
+    fs::write(output_path, raw.as_slice()).map_err(CompilerError::Io)?;
+    Ok(())
 }
 
 /// Compile a service YAML file to validated ServiceSchema
@@ -74,11 +51,4 @@ pub fn compile_service(yaml_path: &str) -> Result<ServiceSchema, CompilerError> 
     let yaml = fs::read_to_string(yaml_path)?;
     let schema = from_yaml_strict(&yaml)?;
     Ok(schema)
-}
-
-/// Forge sealed core.bin for PID 1 bootstrap
-pub fn forge_core_bin(output_path: &str, admin_gid: u32) -> Result<(), CompilerError> {
-    let config = SysxCoreConfig::new(admin_gid);
-    config.forge(output_path)?;
-    Ok(())
 }
