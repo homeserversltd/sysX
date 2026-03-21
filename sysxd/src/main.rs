@@ -46,7 +46,7 @@ fn run() -> Result<(), SysXError> {
     sysxd::dag::validate(&schemas)?;
 
     // Phase 3: Main reactor (`12` §2.2: epoll timeout and cgroup cap from sealed core.bin)
-    sysxd::reactor::run(boot.listener, &boot.core)?;
+    sysxd::reactor::run(boot.listener, &boot.core, &rt)?;
 
     info!("sysxd shutdown complete");
     Ok(())

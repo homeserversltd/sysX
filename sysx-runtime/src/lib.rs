@@ -3,6 +3,8 @@
 //! Surface types and path helpers used by `sysxd` and `sysx-reaper`. Full policy
 //! application is expanded per `12-canonical-spec-v1.md` and `13-sysx-rust-infinite-index-layout.md`.
 
+use std::fs;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use log::debug;
@@ -25,21 +27,23 @@ impl Default for RuntimeContext {
     fn default() -> Self {
         Self {
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
-            service_slice: "sysx.service".to_string(),
+            // Unified SysX band under cgroup v2 (`12` §9.1): `/sys/fs/cgroup/sysx/<svc>/`.
+            service_slice: "sysx".to_string(),
         }
     }
 }
 
 impl RuntimeContext {
-    /// Build context from `SYSX_CGROUP_ROOT` if set; otherwise defaults.
+    /// Build context from `SYSX_CGROUP_ROOT` / `SYSX_SERVICE_SLICE` if set; otherwise defaults.
     pub fn from_env() -> Self {
-        match std::env::var("SYSX_CGROUP_ROOT") {
-            Ok(p) => Self {
-                cgroup_root: PathBuf::from(p),
-                ..Default::default()
-            },
-            Err(_) => Self::default(),
+        let mut s = Self::default();
+        if let Ok(p) = std::env::var("SYSX_CGROUP_ROOT") {
+            s.cgroup_root = PathBuf::from(p);
         }
+        if let Ok(slice) = std::env::var("SYSX_SERVICE_SLICE") {
+            s.service_slice = slice;
+        }
+        s
     }
 
     /// Absolute path to the cgroup directory for a named service.
@@ -71,6 +75,46 @@ pub fn validate_service_id(id: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// IPC UTF-8 service name: `15` §1 + `12` §2 — `^[a-z0-9_-]{1,32}$`.
+pub fn validate_ipc_service_name(id: &str) -> Result<(), RuntimeError> {
+    validate_service_id(id)?;
+    if id.len() > 32 {
+        return Err(RuntimeError::InvalidServiceId(id.to_string()));
+    }
+    let ok = id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if !ok {
+        return Err(RuntimeError::InvalidServiceId(id.to_string()));
+    }
+    Ok(())
+}
+
+/// Read `populated` from cgroup v2 `cgroup.events` (`12` §1 synchronous status evaluation).
+/// Returns `None` if the file is missing; `Some(true)` / `Some(false)` when parsed.
+pub fn read_sysfs_cgroup_populated(events_path: &Path) -> io::Result<Option<bool>> {
+    match fs::read_to_string(events_path) {
+        Ok(s) => Ok(parse_cgroup_events_populated(&s)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Parse `cgroup.events` body for the `populated` field (kernel text format).
+pub fn parse_cgroup_events_populated(content: &str) -> Option<bool> {
+    for line in content.lines() {
+        let mut it = line.split_whitespace();
+        if it.next() == Some("populated") {
+            return match it.next() {
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
 /// Log-only probe: cgroup root exists and is a directory (PID1 / tests).
 pub fn cgroup_root_looks_valid(root: &Path) -> bool {
     let ok = root.is_dir();
@@ -98,9 +142,17 @@ mod tests {
     fn service_cgroup_path_joins() {
         let ctx = RuntimeContext {
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
-            service_slice: "sysx.service".to_string(),
+            service_slice: "sysx".to_string(),
         };
         let p = ctx.service_cgroup_path("web").unwrap();
-        assert!(p.to_string_lossy().ends_with("sysx.service/web"));
+        assert!(p.to_string_lossy().ends_with("sysx/web"));
+    }
+
+    #[test]
+    fn parse_cgroup_events_populated_kernel_shape() {
+        let s = "populated 1\nfrozen 0\n";
+        assert_eq!(parse_cgroup_events_populated(s), Some(true));
+        let s2 = "frozen 0\npopulated 0\n";
+        assert_eq!(parse_cgroup_events_populated(s2), Some(false));
     }
 }

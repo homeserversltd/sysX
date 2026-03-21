@@ -189,10 +189,16 @@ impl Header {
 /// §2.1 outcome: `status_code` = `0x00` success, `0x02` unauthorized (`SO_PEERCRED`).
 pub const OUTCOME_SUCCESS: u8 = 0x00;
 pub const OUTCOME_UNAUTHORIZED: u8 = 0x02;
+/// §2.1 **`0x03`** — wire-level parse / pre-dispatch frame rejection (`12` §2.1).
+pub const OUTCOME_WIRE_PARSE: u8 = 0x03;
 pub const REASON_NA: u8 = 0x00;
 
+/// §2.1.1 Status primary states (`byte0`).
+pub const STATUS_OFFLINE: u8 = 0x00;
 /// §2.1.1 Status reply: primary state `Running`, no secondary reason.
 pub const STATUS_RUNNING: u8 = 0x02;
+/// §2.1.1 — cgroup exists, `populated=0`, directory not yet DFS-unlinked (`12` §3).
+pub const STATUS_SWEEPING: u8 = 0x03;
 pub const STATUS_REASON_NONE: u8 = 0x00;
 
 /// SYSX frame for a response: same header shape as requests, **2-byte** body (`§2.1` / `§2.1.1`).
