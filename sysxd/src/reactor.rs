@@ -1,35 +1,46 @@
 //! Main reactor for sysxd - epoll based event loop
 //!
 //! Handles IPC commands from control socket and cgroup.events monitoring.
-//! Core of the supervision loop after pre-reactor DAG validation.
+//!
+//! `12` §2.2: `epoll_wait` timeout from `core.bin`; partial frame assembly bounded from first byte;
+//! `MAX_CONCURRENT_FDS` caps accepted control connections (`14` §5).
 
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::str;
+use std::time::{Duration, Instant};
 
-use log::{error, info};
+use log::{error, info, warn};
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use sysx_ipc::{
     decode_frame, encode_ipc_reply, peer_allowed_control, validate_peer_credentials, Command,
-    Header, SysxCoreBin, OUTCOME_SUCCESS, OUTCOME_UNAUTHORIZED, OUTCOME_WIRE_PARSE, REASON_NA,
-    STATUS_OFFLINE, STATUS_REASON_NONE, STATUS_RUNNING, STATUS_SWEEPING,
+    FrameError, Header, SysxCoreBin, MAX_CONCURRENT_FDS, MAX_PAYLOAD_BYTES, OUTCOME_SUCCESS,
+    OUTCOME_UNAUTHORIZED, OUTCOME_WIRE_PARSE, REASON_NA, STATUS_OFFLINE, STATUS_REASON_NONE,
+    STATUS_RUNNING, STATUS_SWEEPING,
 };
 use sysx_runtime::{
     read_sysfs_cgroup_populated, validate_ipc_service_name, RuntimeContext,
 };
 
-/// When the request is not decoded, reply with §2.1 outcome bytes using **`Start`** as a neutral
-/// carrier (request context unknown). Not on the wire as a real `Start` command.
+use crate::SysXError;
+
+/// Largest valid request frame (`12` §2.2).
+const MAX_FRAME_BYTES: usize = Header::SIZE + MAX_PAYLOAD_BYTES;
+
 fn reply_pre_dispatch_error(sock: &mut impl Write, b0: u8, b1: u8) {
     let out = encode_ipc_reply(Command::Start, b0, b1);
     let _ = sock.write_all(&out);
 }
 
-use crate::SysXError;
+struct PendingConn {
+    stream: std::os::unix::net::UnixStream,
+    buf: Vec<u8>,
+    asm_deadline: Option<Instant>,
+}
 
-/// Main reactor loop - runs after successful boot and DAG validation (`12` §2.2: `epoll_wait`
-/// timeout from sealed `core.bin` for IPC frame assembly bound; `14` §4 / `17` §5 peer policy).
+/// Main reactor loop (`12` §2.2, `14` §4–5).
 pub fn run(
     listener: UnixListener,
     sealed: &SysxCoreBin,
@@ -43,10 +54,11 @@ pub fn run(
         .map_err(|e| SysXError::Reactor(format!("Failed to create epoll: {}", e)))?;
 
     let listen_fd = listener.as_raw_fd();
-    let ev = EpollEvent::new(EpollFlags::EPOLLIN, listen_fd as u64);
+    let listen_ev = EpollEvent::new(EpollFlags::EPOLLIN, listen_fd as u64);
     epoll
-        .add(&listener, ev)
+        .add(&listener, listen_ev)
         .map_err(|e| SysXError::Reactor(format!("epoll add listener: {}", e)))?;
+    let mut listener_in_epoll = true;
 
     let epoll_ms = u32::from(sealed.epoll_timeout_ms);
     let epoll_timeout = EpollTimeout::try_from(epoll_ms).map_err(|e| {
@@ -56,13 +68,28 @@ pub fn run(
         ))
     })?;
 
+    let asm_budget = Duration::from_millis(sealed.epoll_timeout_ms as u64);
+    let mut clients: HashMap<RawFd, PendingConn> = HashMap::new();
+
     info!(
-        "Starting main reactor (epoll on control socket fd={}, epoll_timeout_ms={}, max_cgroups={})",
-        listen_fd, sealed.epoll_timeout_ms, sealed.max_cgroups
+        "Starting main reactor (listen fd={}, epoll_timeout_ms={}, max_cgroups={}, max_control_fds={})",
+        listen_fd,
+        sealed.epoll_timeout_ms,
+        sealed.max_cgroups,
+        MAX_CONCURRENT_FDS
     );
 
     loop {
-        let mut events = [EpollEvent::empty(); 16];
+        poll_assembly_timeouts(
+            &epoll,
+            &listener,
+            listen_fd,
+            &mut listener_in_epoll,
+            &mut clients,
+            sealed,
+        )?;
+
+        let mut events = [EpollEvent::empty(); 32];
         match epoll.wait(&mut events, epoll_timeout) {
             Ok(n) => {
                 if n == 0 {
@@ -72,9 +99,26 @@ pub fn run(
                 for event in &events[..n] {
                     let fd = event.data() as RawFd;
                     if fd == listen_fd {
-                        accept_and_dispatch(&listener, sealed, rt)?;
+                        accept_clients(
+                            &epoll,
+                            &listener,
+                            listen_fd,
+                            &mut listener_in_epoll,
+                            &mut clients,
+                            sealed,
+                        )?;
                     } else {
-                        error!("unexpected epoll data fd {} (only listener registered)", fd);
+                        on_client_readable(
+                            &epoll,
+                            &listener,
+                            listen_fd,
+                            &mut listener_in_epoll,
+                            fd,
+                            &mut clients,
+                            &asm_budget,
+                            sealed,
+                            rt,
+                        )?;
                     }
                 }
             }
@@ -89,21 +133,132 @@ pub fn run(
     Ok(())
 }
 
-fn accept_and_dispatch(
+fn maybe_resume_listener(
+    epoll: &Epoll,
     listener: &UnixListener,
+    listen_fd: RawFd,
+    listener_in_epoll: &mut bool,
+    active: usize,
+) -> Result<(), SysXError> {
+    if active < MAX_CONCURRENT_FDS {
+        resume_listener(epoll, listener, listen_fd, listener_in_epoll)?;
+    }
+    Ok(())
+}
+
+fn poll_assembly_timeouts(
+    epoll: &Epoll,
+    listener: &UnixListener,
+    listen_fd: RawFd,
+    listener_in_epoll: &mut bool,
+    clients: &mut HashMap<RawFd, PendingConn>,
     sealed: &SysxCoreBin,
-    rt: &RuntimeContext,
+) -> Result<(), SysXError> {
+    let now = Instant::now();
+    let mut expired: Vec<RawFd> = Vec::new();
+    for (fd, conn) in clients.iter() {
+        if let Some(dl) = conn.asm_deadline {
+            if now > dl && matches!(decode_frame(&conn.buf), Err(FrameError::TruncatedHeader)) {
+                error!(
+                    "IPC assembly timeout (epoll_timeout_ms={}): fd={} buf_len={}",
+                    sealed.epoll_timeout_ms,
+                    fd,
+                    conn.buf.len()
+                );
+                expired.push(*fd);
+            }
+        }
+    }
+    let need_resume = !expired.is_empty();
+    for fd in expired {
+        if let Some(mut conn) = remove_client(epoll, clients, fd)? {
+            reply_pre_dispatch_error(&mut conn.stream, OUTCOME_WIRE_PARSE, REASON_NA);
+        }
+    }
+    if need_resume {
+        maybe_resume_listener(epoll, listener, listen_fd, listener_in_epoll, clients.len())?;
+    }
+    Ok(())
+}
+
+fn remove_client(
+    epoll: &Epoll,
+    clients: &mut HashMap<RawFd, PendingConn>,
+    fd: RawFd,
+) -> Result<Option<PendingConn>, SysXError> {
+    if let Some(conn) = clients.remove(&fd) {
+        epoll
+            .delete(&conn.stream)
+            .map_err(|e| SysXError::Reactor(format!("epoll delete client fd={}: {}", fd, e)))?;
+        Ok(Some(conn))
+    } else {
+        Ok(None)
+    }
+}
+
+fn suspend_listener(
+    epoll: &Epoll,
+    listener: &UnixListener,
+    listen_fd: RawFd,
+    listener_in_epoll: &mut bool,
+) -> Result<(), SysXError> {
+    if *listener_in_epoll {
+        epoll.delete(listener).map_err(|e| {
+            SysXError::Reactor(format!("epoll delete listener fd={}: {}", listen_fd, e))
+        })?;
+        *listener_in_epoll = false;
+        info!(
+            "control socket accept suspended (active connections == {})",
+            MAX_CONCURRENT_FDS
+        );
+    }
+    Ok(())
+}
+
+fn resume_listener(
+    epoll: &Epoll,
+    listener: &UnixListener,
+    listen_fd: RawFd,
+    listener_in_epoll: &mut bool,
+) -> Result<(), SysXError> {
+    if !*listener_in_epoll {
+        let ev = EpollEvent::new(EpollFlags::EPOLLIN, listen_fd as u64);
+        epoll.add(listener, ev).map_err(|e| {
+            SysXError::Reactor(format!("epoll re-add listener fd={}: {}", listen_fd, e))
+        })?;
+        *listener_in_epoll = true;
+        info!("control socket accept resumed");
+    }
+    Ok(())
+}
+
+fn accept_clients(
+    epoll: &Epoll,
+    listener: &UnixListener,
+    listen_fd: RawFd,
+    listener_in_epoll: &mut bool,
+    clients: &mut HashMap<RawFd, PendingConn>,
+    sealed: &SysxCoreBin,
 ) -> Result<(), SysXError> {
     loop {
+        if clients.len() >= MAX_CONCURRENT_FDS {
+            suspend_listener(epoll, listener, listen_fd, listener_in_epoll)?;
+            break;
+        }
+
         match listener.accept() {
-            Ok((mut sock, _addr)) => {
+            Ok((sock, _addr)) => {
+                sock.set_nonblocking(true).map_err(|e| {
+                    SysXError::Reactor(format!("client set_nonblocking: {}", e))
+                })?;
                 let fd = sock.as_raw_fd();
 
                 let creds = match validate_peer_credentials(fd) {
                     Ok(c) => c,
                     Err(e) => {
                         error!("SO_PEERCRED failed: {}", e);
-                        reply_pre_dispatch_error(&mut sock, OUTCOME_UNAUTHORIZED, REASON_NA);
+                        let mut s = sock;
+                        reply_pre_dispatch_error(&mut s, OUTCOME_UNAUTHORIZED, REASON_NA);
                         continue;
                     }
                 };
@@ -114,33 +269,32 @@ fn accept_and_dispatch(
                         creds.gid(),
                         sealed.admin_gid
                     );
-                    reply_pre_dispatch_error(&mut sock, OUTCOME_UNAUTHORIZED, REASON_NA);
+                    let mut s = sock;
+                    reply_pre_dispatch_error(&mut s, OUTCOME_UNAUTHORIZED, REASON_NA);
                     continue;
                 }
 
-                let mut buf = [0u8; 8192];
-                let n = match sock.read(&mut buf) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        error!("read from control client: {}", e);
-                        continue;
-                    }
-                };
-                if n == 0 {
-                    continue;
+                let ev = EpollEvent::new(
+                    EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP,
+                    fd as u64,
+                );
+                epoll.add(&sock, ev).map_err(|e| {
+                    SysXError::Reactor(format!("epoll add client fd={}: {}", fd, e))
+                })?;
+
+                clients.insert(
+                    fd,
+                    PendingConn {
+                        stream: sock,
+                        buf: Vec::new(),
+                        asm_deadline: None,
+                    },
+                );
+
+                if clients.len() >= MAX_CONCURRENT_FDS {
+                    suspend_listener(epoll, listener, listen_fd, listener_in_epoll)?;
+                    break;
                 }
-
-                let (hdr, payload) = match decode_frame(&buf[..n]) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        error!("decode_frame failed: {}", e);
-                        reply_pre_dispatch_error(&mut sock, OUTCOME_WIRE_PARSE, REASON_NA);
-                        continue;
-                    }
-                };
-
-                info!("Decoded IPC command {:?}", hdr.command);
-                dispatch_ipc(&mut sock, &hdr, payload, sealed, rt);
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(e) => {
@@ -152,7 +306,111 @@ fn accept_and_dispatch(
     Ok(())
 }
 
-/// `12` §1 / §2.1.1 — `Status` reflects synchronous `cgroup.events` when the service cgroup dir exists.
+fn on_client_readable(
+    epoll: &Epoll,
+    listener: &UnixListener,
+    listen_fd: RawFd,
+    listener_in_epoll: &mut bool,
+    fd: RawFd,
+    clients: &mut HashMap<RawFd, PendingConn>,
+    asm_budget: &Duration,
+    sealed: &SysxCoreBin,
+    rt: &RuntimeContext,
+) -> Result<(), SysXError> {
+    if clients.get(&fd).is_none() {
+        warn!("epoll event for unknown fd {}", fd);
+        return Ok(());
+    }
+
+    let assembly_dead = {
+        let conn = clients.get(&fd).expect("checked");
+        if let Some(dl) = conn.asm_deadline {
+            Instant::now() > dl
+                && matches!(decode_frame(&conn.buf), Err(FrameError::TruncatedHeader))
+        } else {
+            false
+        }
+    };
+    if assembly_dead {
+        error!("IPC assembly deadline exceeded before read fd={}", fd);
+        if let Some(mut c) = remove_client(epoll, clients, fd)? {
+            reply_pre_dispatch_error(&mut c.stream, OUTCOME_WIRE_PARSE, REASON_NA);
+        }
+        maybe_resume_listener(epoll, listener, listen_fd, listener_in_epoll, clients.len())?;
+        return Ok(());
+    }
+
+    let mut tmp = [0u8; 2048];
+    let n = {
+        let conn = clients.get_mut(&fd).expect("present");
+        match conn.stream.read(&mut tmp) {
+            Ok(n) => n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
+            Err(e) => {
+                error!("read control client fd={}: {}", fd, e);
+                remove_client(epoll, clients, fd)?;
+                maybe_resume_listener(epoll, listener, listen_fd, listener_in_epoll, clients.len())?;
+                return Ok(());
+            }
+        }
+    };
+
+    if n == 0 {
+        remove_client(epoll, clients, fd)?;
+        maybe_resume_listener(epoll, listener, listen_fd, listener_in_epoll, clients.len())?;
+        return Ok(());
+    }
+
+    {
+        let conn = clients.get_mut(&fd).expect("present");
+        if conn.buf.is_empty() {
+            conn.asm_deadline = Some(Instant::now() + *asm_budget);
+        }
+        conn.buf.extend_from_slice(&tmp[..n]);
+    }
+
+    if clients.get(&fd).expect("present").buf.len() > MAX_FRAME_BYTES {
+        error!(
+            "IPC frame buffer cap exceeded fd={} len={} (max {})",
+            fd,
+            clients.get(&fd).expect("present").buf.len(),
+            MAX_FRAME_BYTES
+        );
+        if let Some(mut c) = remove_client(epoll, clients, fd)? {
+            reply_pre_dispatch_error(&mut c.stream, OUTCOME_WIRE_PARSE, REASON_NA);
+        }
+        maybe_resume_listener(epoll, listener, listen_fd, listener_in_epoll, clients.len())?;
+        return Ok(());
+    }
+
+    let dec = {
+        let conn = clients.get(&fd).expect("present");
+        decode_frame(&conn.buf)
+    };
+
+    match dec {
+        Ok((hdr, pl)) => {
+            let hdr = hdr.clone();
+            let pl_owned = pl.to_vec();
+            info!("Decoded IPC command {:?}", hdr.command);
+            if let Some(mut c) = remove_client(epoll, clients, fd)? {
+                dispatch_ipc(&mut c.stream, &hdr, &pl_owned, sealed, rt);
+            }
+            maybe_resume_listener(epoll, listener, listen_fd, listener_in_epoll, clients.len())?;
+        }
+        Err(FrameError::TruncatedHeader) => {}
+        Err(e) => {
+            error!("decode_frame failed fd={}: {}", fd, e);
+            if let Some(mut c) = remove_client(epoll, clients, fd)? {
+                reply_pre_dispatch_error(&mut c.stream, OUTCOME_WIRE_PARSE, REASON_NA);
+            }
+            maybe_resume_listener(epoll, listener, listen_fd, listener_in_epoll, clients.len())?;
+        }
+    }
+
+    Ok(())
+}
+
 fn status_from_kernel(rt: &RuntimeContext, name: &str) -> (u8, u8) {
     let cgroup_dir = match rt.service_cgroup_path(name) {
         Ok(p) => p,
