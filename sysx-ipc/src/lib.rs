@@ -193,6 +193,8 @@ pub const OUTCOME_UNAUTHORIZED: u8 = 0x02;
 pub const OUTCOME_WIRE_PARSE: u8 = 0x03;
 /// §2.1 **`0x04`** — epistemic conflict / physical denial (e.g. **`Start`** blocked by **`max_cgroups`**, `12` §2.2).
 pub const OUTCOME_EPISTEMIC_CONFLICT: u8 = 0x04;
+/// §2.1 **`0x05`** — **Tombstoned** outcome (e.g. **`Stop`** ladder step 5 timeout, `12` §4.1, `16` §4).
+pub const OUTCOME_TOMBSTONED: u8 = 0x05;
 pub const REASON_NA: u8 = 0x00;
 /// §2.1 **`reason_code`** **`0x06`** — cgroup capacity (**`max_cgroups`** from **`core.bin`**) with **`status_code`** **`0x04`** (`12` §2.2).
 pub const REASON_CGROUP_CAPACITY: u8 = 0x06;

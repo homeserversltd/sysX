@@ -12,7 +12,6 @@ use std::time::Instant;
 use log::{error, info};
 
 use sysx_runtime::RuntimeContext;
-use sysx_schema::ServiceSchema;
 
 use sysxd::SysXError;
 
@@ -42,7 +41,11 @@ fn run() -> Result<(), SysXError> {
     let boot = sysxd::boot::initialize(&start)?;
 
     // Phase 2: Pre-reactor DAG validation (Kahn topological sort, cycle detection, max depth 16)
-    let schemas = load_schemas()?;
+    let schemas = sysxd::schema_load::load_schemas()?;
+    info!(
+        "SYSX_ORACLE_SCHEMAS_LOADED count={}",
+        schemas.len()
+    );
     sysxd::dag::validate(&schemas)?;
 
     // Phase 3: Main reactor (`12` §2.2: epoll timeout and cgroup cap from sealed core.bin)
@@ -50,13 +53,6 @@ fn run() -> Result<(), SysXError> {
 
     info!("sysxd shutdown complete");
     Ok(())
-}
-
-/// Load service schemas from /etc/sysx/services/
-fn load_schemas() -> Result<Vec<ServiceSchema>, SysXError> {
-    // TODO: implement schema loading from config
-    info!("Loading service schemas (placeholder)");
-    Ok(vec![])
 }
 
 #[cfg(test)]

@@ -21,10 +21,13 @@ pub enum SchemaError {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServiceSchema {
     pub sysx_version: u8,
+    /// If **`false`** or **omitted**, service stays **`Offline`** (`15` §1).
+    #[serde(default)]
     pub enabled: bool,
     pub service: ServiceBlock,
     pub r#type: ServiceType, // `type` is reserved in Rust
     pub timeout_sec: Option<u16>,
+    #[serde(default)]
     pub depends_on: Vec<String>,
     pub recovery: Option<RecoveryPolicy>,
     pub pids: Option<PidsLimit>,
@@ -133,7 +136,22 @@ fn validate_schema(schema: &ServiceSchema) -> Result<(), SchemaError> {
     if schema.service.name.is_empty() {
         return Err(SchemaError::Validation("service.name cannot be empty".to_string()));
     }
+    if !valid_service_name(&schema.service.name) {
+        return Err(SchemaError::Validation(format!(
+            "service.name must match ^[a-z0-9_-]{{1,32}}$ (15 §1): {:?}",
+            schema.service.name
+        )));
+    }
     Ok(())
+}
+
+/// `^[a-z0-9_-]{1,32}$` — same as IPC service name (`12` §2, `15` §1).
+fn valid_service_name(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 32
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 /// Placeholder for strict deserializer that rejects unknown fields
@@ -141,4 +159,30 @@ pub fn from_yaml_strict(yaml: &str) -> Result<ServiceSchema, SchemaError> {
     // TODO: Implement custom deserializer that fails on unknown fields
     // per "unmapped fields result in a hard compilation fault"
     from_yaml(yaml)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL_BASELINE: &str = r#"
+sysx_version: 1
+enabled: true
+service:
+  name: baseline
+  exec: /bin/sh
+  args: ["-c", "echo ok"]
+  env: {}
+  user: "0"
+type: simple
+depends_on: []
+"#;
+
+    #[test]
+    fn minimal_yaml_roundtrip() {
+        let s = from_yaml(MINIMAL_BASELINE).expect("parse");
+        assert!(s.enabled);
+        assert_eq!(s.service.name, "baseline");
+        assert_eq!(s.r#type, ServiceType::Simple);
+    }
 }

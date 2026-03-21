@@ -18,15 +18,16 @@ use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTime
 use sysx_ipc::{
     decode_frame, encode_ipc_reply, peer_allowed_control, validate_peer_credentials, Command,
     FrameError, Header, SysxCoreBin, MAX_CONCURRENT_FDS, MAX_PAYLOAD_BYTES,
-    OUTCOME_EPISTEMIC_CONFLICT, OUTCOME_SUCCESS, OUTCOME_UNAUTHORIZED, OUTCOME_WIRE_PARSE,
-    REASON_CGROUP_CAPACITY, REASON_NA, STATUS_OFFLINE, STATUS_REASON_NONE, STATUS_RUNNING,
-    STATUS_SWEEPING,
+    OUTCOME_EPISTEMIC_CONFLICT, OUTCOME_SUCCESS, OUTCOME_TOMBSTONED, OUTCOME_UNAUTHORIZED,
+    OUTCOME_WIRE_PARSE, REASON_CGROUP_CAPACITY, REASON_NA, STATUS_OFFLINE, STATUS_REASON_NONE,
+    STATUS_RUNNING, STATUS_SWEEPING,
 };
 use sysx_runtime::{
     read_sysfs_cgroup_populated, validate_ipc_service_name, RuntimeContext,
 };
 
 use crate::cgroup_ops::{ensure_start_cgroup, StartCgroupError};
+use crate::stop_ladder::{stop_service, StopOutcome};
 use crate::terminal_broadcast::{
     run_terminal_broadcast, TerminalBroadcastKind,
 };
@@ -112,6 +113,7 @@ pub fn run(
         sealed.max_cgroups,
         MAX_CONCURRENT_FDS
     );
+    info!("SYSX_ORACLE_REACTOR_READY (11 serial oracle)");
 
     loop {
         poll_assembly_timeouts(
@@ -588,7 +590,31 @@ fn dispatch_ipc(
                 reply_pre_dispatch_error(sock, OUTCOME_WIRE_PARSE, REASON_NA);
                 return;
             }
-            let out = encode_ipc_reply(hdr.command, OUTCOME_SUCCESS, REASON_NA);
+            let (b0, b1) = match stop_service(rt, name) {
+                Ok(StopOutcome::AlreadyGone) => {
+                    info!("Stop {:?}: AlreadyGone (12 §4)", name);
+                    (OUTCOME_SUCCESS, REASON_NA)
+                }
+                Ok(StopOutcome::Dead) => {
+                    info!(
+                        "Stop {:?}: Dead after ladder + DFS unlink (12 §4.1 / §4.1.1)",
+                        name
+                    );
+                    (OUTCOME_SUCCESS, REASON_NA)
+                }
+                Ok(StopOutcome::Tombstoned) => {
+                    info!(
+                        "Stop {:?}: Tombstoned [S:{:#04x}, R:{:#04x}] (12 §4.1)",
+                        name, OUTCOME_TOMBSTONED, REASON_NA
+                    );
+                    (OUTCOME_TOMBSTONED, REASON_NA)
+                }
+                Err(e) => {
+                    error!("Stop {:?}: ladder I/O error: {}", name, e);
+                    (OUTCOME_EPISTEMIC_CONFLICT, REASON_NA)
+                }
+            };
+            let out = encode_ipc_reply(Command::Stop, b0, b1);
             if let Err(e) = sock.write_all(&out) {
                 error!("reply write failed: {}", e);
             }

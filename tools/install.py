@@ -265,16 +265,27 @@ def phase_initramfs_layout(sysx_root: Path, build_dir: Path) -> bool:
         (rootfs / "sbin" / "init").chmod(0o755)
 
     # Sealed boot artifact (required by sysxd boot; 17)
-    schema_dir = rootfs / "etc" / "sysx"
-    schema_dir.mkdir(parents=True, exist_ok=True)
-    if not forge_core_bin(sysx_root, schema_dir / "core.bin", admin_gid=0):
+    sysx_etc = rootfs / "etc" / "sysx"
+    sysx_etc.mkdir(parents=True, exist_ok=True)
+    if not forge_core_bin(sysx_root, sysx_etc / "core.bin", admin_gid=0):
         return False
 
-    (schema_dir / "test.yaml").write_text("""services:
-  baseline:
-    command: ["/bin/sh", "-c", "echo 'SYSX_BASELINE_STARTED'; exec sleep 3600"]
-    depends_on: []
-""")
+    # `15` — one file per service under /etc/sysx/schemas/
+    schemas_dir = sysx_etc / "schemas"
+    schemas_dir.mkdir(parents=True, exist_ok=True)
+    (schemas_dir / "baseline.yaml").write_text(
+        """sysx_version: 1
+enabled: true
+service:
+  name: baseline
+  exec: /bin/sh
+  args: ["-c", "echo SYSX_BASELINE_WORKLOAD; sleep 3600"]
+  env: {}
+  user: "0"
+type: simple
+depends_on: []
+"""
+    )
 
     print(f"[SUCCESS] Initramfs layout forged at {rootfs}")
     return True
@@ -286,6 +297,7 @@ def phase_qemu_headless(
     kernel: Optional[Path],
     run_vm: bool,
     qemu_timeout_sec: int,
+    oracle_strict: bool = False,
 ) -> bool:
     """Phase 3: Pack initramfs; optionally run QEMU with kernel bzImage."""
     print("\n=== PHASE 3: INITRAMFS PACK + QEMU ===")
@@ -342,11 +354,42 @@ def phase_qemu_headless(
             cwd=build_dir,
             timeout=qemu_timeout_sec,
             text=True,
+            capture_output=True,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as ex:
         print("[INFO] QEMU hit timeout (expected if sysxd hangs in reactor loop)")
+        serial = (ex.stdout or "") + (ex.stderr or "")
+        ok = verify_serial_oracle(serial, strict=oracle_strict)
+        if oracle_strict and not ok:
+            return False
         return True
+    serial = (r.stdout or "") + (r.stderr or "")
+    ok = verify_serial_oracle(serial, strict=oracle_strict)
+    if oracle_strict and not ok:
+        return False
     print(f"[INFO] QEMU exited with code {r.returncode}")
+    return True
+
+
+# `11` — Phase 1: serial markers; dual IPC vs sysfs is a later phase.
+_ORACLE_MARKERS_REQUIRED = (
+    "SYSX_ORACLE_SCHEMAS_LOADED",
+    "SYSX_ORACLE_DAG_OK",
+    "SYSX_ORACLE_REACTOR_READY",
+)
+
+
+def verify_serial_oracle(serial_text: str, strict: bool = False) -> bool:
+    """Pass/fail hints on captured QEMU serial (`11`)."""
+    missing = [m for m in _ORACLE_MARKERS_REQUIRED if m not in serial_text]
+    if missing:
+        msg = f"[ORACLE] Missing serial markers: {missing} (11 §oracle constraints)"
+        if strict:
+            print(msg, file=sys.stderr)
+            return False
+        print(f"[ORACLE] {msg} (non-strict: continue)")
+        return True
+    print("[ORACLE] Serial markers OK:", ", ".join(_ORACLE_MARKERS_REQUIRED))
     return True
 
 
@@ -379,6 +422,11 @@ def main():
         default=12,
         help="Seconds before QEMU is killed (smoke test)",
     )
+    parser.add_argument(
+        "--oracle-strict",
+        action="store_true",
+        help="Fail if QEMU serial is missing SYSX_ORACLE_* markers (11)",
+    )
     args = parser.parse_args()
 
     args.build_dir.mkdir(parents=True, exist_ok=True)
@@ -399,6 +447,7 @@ def main():
             args.kernel,
             args.qemu_run,
             args.qemu_timeout,
+            oracle_strict=args.oracle_strict,
         )
 
     if success:

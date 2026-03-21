@@ -1,35 +1,42 @@
 # sysX
-*TESTING DO NOT USE STILL BUILDING*
-Deterministic PID 1 for sovereign infrastructure.
 
-## Structure
+**Pre-release — not production-ready.**
 
-- `sysx-schema/` — YAML → `ServiceSchema` with strict unknown field validation (per `15-schema-contract-v1.md`)
-- `sysx-compiler/` — Compiler CLI + core.bin forger (`17-sysx-sealed-boot-core-bin.md` §4)
+SysX is a Rust control stack for the machine: it supervises services and, more importantly, **spawns every workload into a policy-defined environment** you declare in schema. Namespaces (mount, network, PID, user), capability sets, cgroup envelopes (CPU weight, memory, PIDs), and filesystem view (read-only root, tmpfs maps) are first-class inputs, not afterthoughts bolted on outside the supervisor.
 
-## Building
+That means you can land a process in a **minimal cage** (for example: no usable network view, no inherited file hierarchy you did not explicitly mount, privilege dropped before `execve`) or run a conventional service under **hard resource bounds** (CPU share, RAM, process count) with the same contract. Lifecycle, cleanup, and observability stay tied to **cgroup v2 ground truth**, not PID files or wrapper scripts.
+
+**What you get:** an open execution fabric—declarative service definitions, a compiler path to sealed boot artifacts, and a small binary control surface so operators can reason about *what runs where and under what limits* from data, not folklore.
+
+## Repository layout
+
+| Path | Role |
+|------|------|
+| `sysx-schema/` | YAML → `ServiceSchema` with strict validation |
+| `sysx-compiler/` | Compiler CLI and sealed `core.bin` forger |
+| `sysx-runtime/` | Cgroup / namespace / capability policy types and path helpers |
+| `sysxd/` | Supervisor (reactor, lifecycle) |
+| `sysx-cli/` | Operator CLI |
+| `sysx-ipc/` | Binary IPC framing |
+
+## Build
+
+From the repository root:
 
 ```bash
-cd /home/owner/git/sysX
 cargo build
 ```
 
-## Usage
+## Quick usage
 
 ```bash
 # Compile a service schema
-cargo run --bin sysx-compiler -- compile /etc/sysx/schemas/example.yaml
+cargo run -p sysx-compiler -- compile /etc/sysx/schemas/example.yaml
 
-# Forge sealed core.bin (32-byte artifact for PID 1)
-cargo run --bin sysx-compiler -- forge-core /etc/sysx/core.bin 1000
+# Forge sealed core.bin (32-byte PID 1 boot artifact)
+cargo run -p sysx-compiler -- forge-core /etc/sysx/core.bin 1000
 ```
 
-## Contracts
+## License
 
-- **Schema**: `15-schema-contract-v1.md` — absolute source of truth. Unmapped fields = hard fault.
-- **Core Binary**: `17-sysx-sealed-boot-core-bin.md` — 32-byte fixed layout, zero-allocation read in PID 1.
-- **Canonical Spec**: `12-canonical-spec-v1.md`
-
-See `docs/memories/ongoing/sysX/` for full specification.
-
-This implementation satisfies the batch directive for AMAYMON_WORKER 3/9 track_label=3.
+See `LICENSE`.
