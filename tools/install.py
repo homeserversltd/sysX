@@ -280,7 +280,7 @@ enabled: true
 service:
   name: baseline
   exec: /bin/sh
-  args: ["-c", "echo SYSX_BASELINE_WORKLOAD; sleep 3600"]
+  args: ["-c", "echo -n R >&3; echo SYSX_BASELINE_WORKLOAD; sleep 3600"]
   env: {}
   user: "0"
 type: simple
@@ -300,6 +300,8 @@ def phase_qemu_headless(
     qemu_timeout_sec: int,
     oracle_strict: bool = False,
     dual_oracle_strict: bool = False,
+    test0_strict: bool = False,
+    autotest_service: str = "baseline",
 ) -> bool:
     """Phase 3: Pack initramfs; optionally run QEMU with kernel bzImage."""
     print("\n=== PHASE 3: INITRAMFS PACK + QEMU ===")
@@ -327,7 +329,7 @@ def phase_qemu_headless(
         print("[INFO] No --kernel provided (or path missing). Initramfs ready.")
         print(
             f"  qemu-system-x86_64 -m 512M -kernel <bzImage> -initrd {initramfs} "
-            '-append "console=ttyS0 panic=1" -nographic'
+            '-append "console=ttyS0 quiet panic=1 sysx.autotest=stop:baseline" -nographic'
         )
         return True
 
@@ -337,6 +339,11 @@ def phase_qemu_headless(
 
     print(f"[SYSX] Launching QEMU (timeout {qemu_timeout_sec}s) kernel={kernel}")
     # -nographic implies serial on stdio; do not also pass -serial stdio (QEMU 10+ errors).
+    # `sysx.autotest=stop:<svc>`: sysxd runs `Stop` after FD3 readiness (Phase 3 oracle).
+    append = (
+        f"console=ttyS0 quiet panic=1 "
+        f"sysx.autotest=stop:{autotest_service}"
+    )
     cmd = [
         qemu_bin,
         "-m",
@@ -346,7 +353,7 @@ def phase_qemu_headless(
         "-initrd",
         str(initramfs),
         "-append",
-        "console=ttyS0 panic=1",
+        append,
         "-nographic",
         "-no-reboot",
     ]
@@ -363,17 +370,23 @@ def phase_qemu_headless(
         serial = (ex.stdout or "") + (ex.stderr or "")
         ok_s = verify_serial_oracle(serial, strict=oracle_strict)
         ok_d = verify_dual_oracle(serial, strict=dual_oracle_strict)
+        ok_t0 = verify_test0_oracle(serial, service=autotest_service, strict=test0_strict)
         if oracle_strict and not ok_s:
             return False
         if dual_oracle_strict and not ok_d:
+            return False
+        if test0_strict and not ok_t0:
             return False
         return True
     serial = (r.stdout or "") + (r.stderr or "")
     ok_s = verify_serial_oracle(serial, strict=oracle_strict)
     ok_d = verify_dual_oracle(serial, strict=dual_oracle_strict)
+    ok_t0 = verify_test0_oracle(serial, service=autotest_service, strict=test0_strict)
     if oracle_strict and not ok_s:
         return False
     if dual_oracle_strict and not ok_d:
+        return False
+    if test0_strict and not ok_t0:
         return False
     print(f"[INFO] QEMU exited with code {r.returncode}")
     return True
@@ -383,8 +396,13 @@ def phase_qemu_headless(
 _ORACLE_MARKERS_REQUIRED = (
     "SYSX_ORACLE_SCHEMAS_LOADED",
     "SYSX_ORACLE_DAG_OK",
+    "SYSX_ORACLE_BOOTSTRAP",
     "SYSX_ORACLE_REACTOR_READY",
 )
+
+# Phase 3 — FD3 readiness + DFS unlink (hypervisor Test 0).
+_TEST0_READINESS = "[SYSX] ORACLE_READINESS"
+_TEST0_DFS = "[SYSX] ORACLE_DFS_UNLINK_COMPLETE"
 
 # `11` § Test 0 / dual-oracle — lines emitted by sysxd `reactor.rs` after IPC dispatch.
 _ORACLE_DUAL_RE = re.compile(
@@ -466,6 +484,24 @@ def verify_serial_oracle(serial_text: str, strict: bool = False) -> bool:
     return True
 
 
+def verify_test0_oracle(serial_text: str, service: str = "baseline", strict: bool = False) -> bool:
+    """Phase 3 Test 0: FD3 readiness then DFS post-order unlink complete (`sysx.autotest=stop:<svc>`)."""
+    ok_r = _TEST0_READINESS in serial_text and f"service={service}" in serial_text
+    ok_d = _TEST0_DFS in serial_text and f"service={service}" in serial_text
+    if not ok_r or not ok_d:
+        msg = (
+            f"[ORACLE] Test0 missing readiness={ok_r} dfs_unlink={ok_d} "
+            f"(need {_TEST0_READINESS!r} and {_TEST0_DFS!r} for service={service})"
+        )
+        if strict:
+            print(msg, file=sys.stderr)
+            return False
+        print(f"{msg} (non-strict: continue)")
+        return True
+    print("[ORACLE] Test0 OK (readiness + DFS unlink markers)")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="SysX Install Tool - Hypervisor Test Pipeline")
     parser.add_argument(
@@ -505,6 +541,16 @@ def main():
         action="store_true",
         help="Fail if SYSX_ORACLE_DUAL lines missing or status sysfs_match!=1 (11 Test 0)",
     )
+    parser.add_argument(
+        "--test0-strict",
+        action="store_true",
+        help="Fail if Phase 3 Test0 markers missing (ORACLE_READINESS + ORACLE_DFS_UNLINK_COMPLETE)",
+    )
+    parser.add_argument(
+        "--autotest-service",
+        default="baseline",
+        help="Kernel cmdline sysx.autotest=stop:<name> (default baseline)",
+    )
     args = parser.parse_args()
 
     args.build_dir.mkdir(parents=True, exist_ok=True)
@@ -527,6 +573,8 @@ def main():
             args.qemu_timeout,
             oracle_strict=args.oracle_strict,
             dual_oracle_strict=args.dual_oracle_strict,
+            test0_strict=args.test0_strict,
+            autotest_service=args.autotest_service,
         )
 
     if success:

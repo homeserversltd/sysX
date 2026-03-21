@@ -20,8 +20,9 @@ use sysx_ipc::{
     decode_frame, encode_ipc_reply, peer_allowed_control, validate_peer_credentials, Command,
     FrameError, Header, SysxCoreBin, MAX_CONCURRENT_FDS, MAX_PAYLOAD_BYTES,
     OUTCOME_EPISTEMIC_CONFLICT, OUTCOME_SUCCESS, OUTCOME_TOMBSTONED, OUTCOME_UNAUTHORIZED,
-    OUTCOME_WIRE_PARSE, REASON_CGROUP_CAPACITY, REASON_NA, STATUS_DEAD_PRIMARY, STATUS_OFFLINE,
-    STATUS_REASON_NONE, STATUS_RUNNING, STATUS_SWEEPING, STATUS_TOMBSTONED_PRIMARY,
+    OUTCOME_WIRE_PARSE, REASON_CGROUP_CAPACITY, REASON_NA, STATUS_DEAD_PRIMARY, STATUS_FAILED_PRIMARY,
+    STATUS_OFFLINE, STATUS_REASON_NONE, STATUS_REASON_ORPHANED, STATUS_RUNNING, STATUS_SWEEPING,
+    STATUS_TOMBSTONED_PRIMARY,
 };
 use sysx_schema::ServiceSchema;
 use sysx_runtime::{
@@ -29,6 +30,8 @@ use sysx_runtime::{
 };
 
 use crate::cgroup_ops::{ensure_start_cgroup, StartCgroupError};
+use crate::dag::DagRuntime;
+use crate::orchestration::{record_service_failed, propagate_cascade_failure, OrchestratorState};
 use crate::service_spawn::{spawn_simple_service, SpawnOutcome};
 use crate::stop_ladder::{
     dfs_post_order_rmdir, is_rmdir_ebusy, stop_service, StopOutcome,
@@ -63,6 +66,9 @@ pub fn run(
     tombstoned: Arc<Mutex<HashSet<String>>>,
     dfs_proven_dead: Arc<Mutex<HashSet<String>>>,
     schemas: Arc<HashMap<String, ServiceSchema>>,
+    dag: Arc<DagRuntime>,
+    orch: Arc<Mutex<OrchestratorState>>,
+    autotest_stop_after_readiness: Option<String>,
 ) -> Result<(), SysXError> {
     listener
         .set_nonblocking(true)
@@ -166,6 +172,18 @@ pub fn run(
     );
     info!("SYSX_ORACLE_REACTOR_READY (11 serial oracle)");
 
+    orchestration_bootstrap(
+        rt,
+        sealed,
+        &schemas,
+        &dag,
+        &orch,
+        &tombstoned,
+        &dfs_proven_dead,
+        &epoll,
+        &readiness_files,
+    )?;
+
     let wake_fd = wake_file.as_raw_fd();
 
     loop {
@@ -217,6 +235,14 @@ pub fn run(
                             fd,
                             &readiness_files,
                             &epoll,
+                            rt,
+                            sealed,
+                            &tombstoned,
+                            &dfs_proven_dead,
+                            &schemas,
+                            &dag,
+                            &orch,
+                            &autotest_stop_after_readiness,
                         )?;
                     } else {
                         on_client_readable(
@@ -233,6 +259,8 @@ pub fn run(
                             &dfs_proven_dead,
                             &schemas,
                             &readiness_files,
+                            &dag,
+                            &orch,
                         )?;
                     }
                 }
@@ -435,6 +463,8 @@ fn on_client_readable(
     dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
     schemas: &Arc<HashMap<String, ServiceSchema>>,
     readiness_files: &Arc<Mutex<HashMap<RawFd, (String, std::fs::File)>>>,
+    dag: &Arc<DagRuntime>,
+    orch: &Arc<Mutex<OrchestratorState>>,
 ) -> Result<(), SysXError> {
     if clients.get(&fd).is_none() {
         warn!("epoll event for unknown fd {}", fd);
@@ -524,6 +554,8 @@ fn on_client_readable(
                     schemas,
                     epoll,
                     readiness_files,
+                    dag,
+                    orch,
                 );
             }
             maybe_resume_listener(epoll, listener, listen_fd, listener_in_epoll, clients.len())?;
@@ -606,31 +638,21 @@ fn apply_reaper_dfs(
     }
 }
 
-fn handle_readiness_fd(
-    fd: RawFd,
-    readiness_files: &Arc<Mutex<HashMap<RawFd, (String, std::fs::File)>>>,
-    _epoll: &Epoll,
-) -> Result<(), SysXError> {
-    let mut buf = [0u8; 64];
-    let mut m = readiness_files
-        .lock()
-        .map_err(|e| SysXError::Reactor(format!("readiness lock: {}", e)))?;
-    if let Some((name, file)) = m.get_mut(&fd) {
-        match file.read(&mut buf) {
-            Ok(n) => info!("readiness FD3 n={} service={}", n, name),
-            Err(e) => warn!("readiness read service={}: {}", name, e),
-        }
-    }
-    Ok(())
-}
-
 /// `12` §3 / §4.1.1: **`Dead`** only when cgroup path is **absent** and supervisor has **DFS proof**
 /// (`dfs_proven_dead`). While directory exists and `populated=0`, state is **`Sweeping`** (empty-but-pinned).
 fn evaluate_status_abi(
     rt: &RuntimeContext,
     name: &str,
     dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
+    orch: &Arc<Mutex<OrchestratorState>>,
 ) -> (u8, u8) {
+    if orch
+        .lock()
+        .map(|g| g.cascade_failed.contains(name))
+        .unwrap_or(false)
+    {
+        return (STATUS_FAILED_PRIMARY, STATUS_REASON_ORPHANED);
+    }
     let cgroup_dir = match rt.service_cgroup_path(name) {
         Ok(p) => p,
         Err(_) => return (STATUS_OFFLINE, STATUS_REASON_NONE),
@@ -683,11 +705,12 @@ fn status_reply(
     name: &str,
     tombstoned: &Arc<Mutex<HashSet<String>>>,
     dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
+    orch: &Arc<Mutex<OrchestratorState>>,
 ) -> (u8, u8) {
     if is_tombstoned(tombstoned, name) {
         return (STATUS_TOMBSTONED_PRIMARY, STATUS_REASON_NONE);
     }
-    evaluate_status_abi(rt, name, dfs_proven_dead)
+    evaluate_status_abi(rt, name, dfs_proven_dead, orch)
 }
 
 fn sysfs_populated_label(rt: &RuntimeContext, name: &str) -> &'static str {
@@ -710,8 +733,9 @@ fn status_sysfs_matches_ipc(
     ipc_b1: u8,
     tombstoned: &Arc<Mutex<HashSet<String>>>,
     dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
+    orch: &Arc<Mutex<OrchestratorState>>,
 ) -> u8 {
-    let k = status_reply(rt, name, tombstoned, dfs_proven_dead);
+    let k = status_reply(rt, name, tombstoned, dfs_proven_dead, orch);
     u8::from(k.0 == ipc_b0 && k.1 == ipc_b1)
 }
 
@@ -725,6 +749,7 @@ fn log_oracle_dual(
     rt: &RuntimeContext,
     tombstoned: &Arc<Mutex<HashSet<String>>>,
     dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
+    orch: &Arc<Mutex<OrchestratorState>>,
 ) {
     let sysfs_pop = sysfs_populated_label(rt, name);
     if hdr_cmd == Command::Status {
@@ -735,6 +760,7 @@ fn log_oracle_dual(
             ipc_b1,
             tombstoned,
             dfs_proven_dead,
+            orch,
         );
         info!(
             "SYSX_ORACLE_DUAL op={} service={} ipc=S:0x{:02x}:R:0x{:02x} sysfs_populated={} sysfs_match={} (11)",
@@ -759,6 +785,8 @@ fn dispatch_ipc(
     schemas: &Arc<HashMap<String, ServiceSchema>>,
     epoll: &Epoll,
     readiness_files: &Arc<Mutex<HashMap<RawFd, (String, std::fs::File)>>>,
+    dag: &Arc<DagRuntime>,
+    orch: &Arc<Mutex<OrchestratorState>>,
 ) {
     let plen = payload.len();
     match hdr.command {
@@ -821,6 +849,7 @@ fn dispatch_ipc(
                     rt,
                     tombstoned,
                     dfs_proven_dead,
+                    orch,
                 );
                 return;
             }
@@ -853,6 +882,7 @@ fn dispatch_ipc(
                     rt,
                     tombstoned,
                     dfs_proven_dead,
+                    orch,
                 );
                 }
                 Err(e) => {
@@ -870,6 +900,7 @@ fn dispatch_ipc(
                         rt,
                         tombstoned,
                         dfs_proven_dead,
+                        orch,
                     );
                 }
             }
@@ -905,6 +936,49 @@ fn dispatch_ipc(
                     rt,
                     tombstoned,
                     dfs_proven_dead,
+                    orch,
+                );
+                return;
+            }
+            if orch
+                .lock()
+                .map(|g| g.cascade_failed.contains(name))
+                .unwrap_or(false)
+            {
+                info!("Start {:?}: cascade_failed — deny (Phase 3)", name);
+                let out = encode_ipc_reply(Command::Start, OUTCOME_EPISTEMIC_CONFLICT, REASON_NA);
+                if let Err(e) = sock.write_all(&out) {
+                    error!("reply write failed: {}", e);
+                }
+                log_oracle_dual(
+                    "start",
+                    name,
+                    Command::Start,
+                    OUTCOME_EPISTEMIC_CONFLICT,
+                    REASON_NA,
+                    rt,
+                    tombstoned,
+                    dfs_proven_dead,
+                    orch,
+                );
+                return;
+            }
+            if let Err(msg) = orchestration_ipc_start_allowed(name, schemas, dag, &orch) {
+                info!("Start {:?}: blocked ({})", name, msg);
+                let out = encode_ipc_reply(Command::Start, OUTCOME_EPISTEMIC_CONFLICT, REASON_NA);
+                if let Err(e) = sock.write_all(&out) {
+                    error!("reply write failed: {}", e);
+                }
+                log_oracle_dual(
+                    "start",
+                    name,
+                    Command::Start,
+                    OUTCOME_EPISTEMIC_CONFLICT,
+                    REASON_NA,
+                    rt,
+                    tombstoned,
+                    dfs_proven_dead,
+                    orch,
                 );
                 return;
             }
@@ -929,6 +1003,9 @@ fn dispatch_ipc(
                                             error!("epoll add readiness fd={}: {}", rfd, e);
                                         }
                                     }
+                                }
+                                if let Ok(mut g) = orch.lock() {
+                                    g.starting.insert(name.to_string());
                                 }
                                 (OUTCOME_SUCCESS, REASON_NA)
                             }
@@ -973,6 +1050,7 @@ fn dispatch_ipc(
                 rt,
                 tombstoned,
                 dfs_proven_dead,
+                orch,
             );
         }
         Command::Stop => {
@@ -1006,6 +1084,7 @@ fn dispatch_ipc(
                     rt,
                     tombstoned,
                     dfs_proven_dead,
+                    orch,
                 );
                 return;
             }
@@ -1018,6 +1097,14 @@ fn dispatch_ipc(
                     if let Ok(mut g) = dfs_proven_dead.lock() {
                         g.insert(name.to_string());
                     }
+                    if let Ok(mut g) = orch.lock() {
+                        g.running.remove(name);
+                        g.starting.remove(name);
+                    }
+                    info!(
+                        "[SYSX] ORACLE_DFS_UNLINK_COMPLETE service={} (AlreadyGone)",
+                        name
+                    );
                     (OUTCOME_SUCCESS, REASON_NA)
                 }
                 Ok(StopOutcome::Dead) => {
@@ -1031,6 +1118,14 @@ fn dispatch_ipc(
                     if let Ok(mut g) = dfs_proven_dead.lock() {
                         g.insert(name.to_string());
                     }
+                    if let Ok(mut g) = orch.lock() {
+                        g.running.remove(name);
+                        g.starting.remove(name);
+                    }
+                    info!(
+                        "[SYSX] ORACLE_DFS_UNLINK_COMPLETE service={} (Dead)",
+                        name
+                    );
                     (OUTCOME_SUCCESS, REASON_NA)
                 }
                 Ok(StopOutcome::Tombstoned) => {
@@ -1040,6 +1135,10 @@ fn dispatch_ipc(
                     );
                     if let Ok(mut g) = tombstoned.lock() {
                         g.insert(name.to_string());
+                    }
+                    if let Ok(mut g) = orch.lock() {
+                        g.running.remove(name);
+                        g.starting.remove(name);
                     }
                     (OUTCOME_TOMBSTONED, REASON_NA)
                 }
@@ -1061,6 +1160,7 @@ fn dispatch_ipc(
                 rt,
                 tombstoned,
                 dfs_proven_dead,
+                orch,
             );
         }
         Command::Status => {
@@ -1079,7 +1179,7 @@ fn dispatch_ipc(
                 reply_pre_dispatch_error(sock, OUTCOME_WIRE_PARSE, REASON_NA);
                 return;
             }
-            let (b0, b1) = status_reply(rt, name, tombstoned, dfs_proven_dead);
+            let (b0, b1) = status_reply(rt, name, tombstoned, dfs_proven_dead, orch);
             info!(
                 "Status {:?} -> [S:{:#04x}, R:{:#04x}] (12 §2.1.1)",
                 name, b0, b1
@@ -1097,7 +1197,306 @@ fn dispatch_ipc(
                 rt,
                 tombstoned,
                 dfs_proven_dead,
+                orch,
             );
         }
+    }
+}
+
+fn orchestration_ipc_start_allowed(
+    name: &str,
+    schemas: &Arc<HashMap<String, ServiceSchema>>,
+    dag: &Arc<DagRuntime>,
+    orch: &Arc<Mutex<OrchestratorState>>,
+) -> Result<(), &'static str> {
+    let schema = schemas.get(name).ok_or("unknown service")?;
+    let g = orch.lock().map_err(|_| "orch lock poisoned")?;
+    for d in &schema.depends_on {
+        if g.cascade_failed.contains(d) {
+            drop(g);
+            propagate_cascade_failure(name, dag, orch);
+            return Err("upstream dependency failed");
+        }
+        if !g.running.contains(d) {
+            return Err("upstream not Running");
+        }
+    }
+    Ok(())
+}
+
+fn orchestration_bootstrap(
+    rt: &RuntimeContext,
+    sealed: &SysxCoreBin,
+    schemas: &Arc<HashMap<String, ServiceSchema>>,
+    dag: &Arc<DagRuntime>,
+    orch: &Arc<Mutex<OrchestratorState>>,
+    tombstoned: &Arc<Mutex<HashSet<String>>>,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
+    epoll: &Epoll,
+    readiness_files: &Arc<Mutex<HashMap<RawFd, (String, std::fs::File)>>>,
+) -> Result<(), SysXError> {
+    info!(
+        "SYSX_ORACLE_BOOTSTRAP dag_services={}",
+        dag.boot_order.len()
+    );
+    try_spawn_ready_services(
+        rt,
+        sealed,
+        tombstoned,
+        dfs_proven_dead,
+        schemas,
+        epoll,
+        readiness_files,
+        dag,
+        orch,
+    );
+    Ok(())
+}
+
+fn try_spawn_ready_services(
+    rt: &RuntimeContext,
+    sealed: &SysxCoreBin,
+    tombstoned: &Arc<Mutex<HashSet<String>>>,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
+    schemas: &Arc<HashMap<String, ServiceSchema>>,
+    epoll: &Epoll,
+    readiness_files: &Arc<Mutex<HashMap<RawFd, (String, std::fs::File)>>>,
+    dag: &Arc<DagRuntime>,
+    orch: &Arc<Mutex<OrchestratorState>>,
+) {
+    for name in &dag.boot_order {
+        let skip = orch
+            .lock()
+            .map(|g| {
+                g.running.contains(name)
+                    || g.starting.contains(name)
+                    || g.cascade_failed.contains(name)
+            })
+            .unwrap_or(true);
+        if skip {
+            continue;
+        }
+        let Some(schema) = schemas.get(name) else {
+            continue;
+        };
+        if !schema.enabled {
+            continue;
+        }
+        let deps_ok = {
+            let g = match orch.lock() {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            let mut ok = true;
+            for d in &schema.depends_on {
+                if g.cascade_failed.contains(d) {
+                    ok = false;
+                    break;
+                }
+                if !g.running.contains(d) {
+                    ok = false;
+                    break;
+                }
+            }
+            ok
+        };
+        if !deps_ok {
+            continue;
+        }
+        if let Err(e) = spawn_service_for_orchestration(
+            name,
+            rt,
+            sealed,
+            tombstoned,
+            dfs_proven_dead,
+            schemas,
+            epoll,
+            readiness_files,
+            orch,
+        ) {
+            warn!("orchestration spawn service={}: {}", name, e);
+        }
+    }
+}
+
+fn spawn_service_for_orchestration(
+    name: &str,
+    rt: &RuntimeContext,
+    sealed: &SysxCoreBin,
+    tombstoned: &Arc<Mutex<HashSet<String>>>,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
+    schemas: &Arc<HashMap<String, ServiceSchema>>,
+    epoll: &Epoll,
+    readiness_files: &Arc<Mutex<HashMap<RawFd, (String, std::fs::File)>>>,
+    orch: &Arc<Mutex<OrchestratorState>>,
+) -> Result<(), String> {
+    if is_tombstoned(tombstoned, name) {
+        return Err("tombstoned".into());
+    }
+    if orch
+        .lock()
+        .map(|g| g.cascade_failed.contains(name))
+        .unwrap_or(false)
+    {
+        return Err("cascade_failed".into());
+    }
+    if orch
+        .lock()
+        .map(|g| g.running.contains(name) || g.starting.contains(name))
+        .unwrap_or(true)
+    {
+        return Err("already running or starting".into());
+    }
+    ensure_start_cgroup(rt, name, sealed.max_cgroups).map_err(|e| format!("{:?}", e))?;
+    let schema = schemas.get(name).ok_or_else(|| "no schema".to_string())?;
+    let outcome = spawn_simple_service(rt, schema).map_err(|e| e.to_string())?;
+    if let Ok(mut g) = dfs_proven_dead.lock() {
+        g.remove(name);
+    }
+    let SpawnOutcome { readiness_read } = outcome;
+    let rfd = readiness_read.as_raw_fd();
+    let ev = EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP, rfd as u64);
+    let mut m = readiness_files
+        .lock()
+        .map_err(|e| format!("readiness map: {}", e))?;
+    m.insert(rfd, (name.to_string(), readiness_read));
+    if let Some((_, f)) = m.get(&rfd) {
+        epoll.add(f, ev).map_err(|e| format!("epoll add readiness: {}", e))?;
+    }
+    drop(m);
+    if let Ok(mut g) = orch.lock() {
+        g.starting.insert(name.to_string());
+    }
+    info!("orchestration spawned service={} (awaiting FD3)", name);
+    Ok(())
+}
+
+fn handle_readiness_fd(
+    fd: RawFd,
+    readiness_files: &Arc<Mutex<HashMap<RawFd, (String, std::fs::File)>>>,
+    epoll: &Epoll,
+    rt: &RuntimeContext,
+    sealed: &SysxCoreBin,
+    tombstoned: &Arc<Mutex<HashSet<String>>>,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
+    schemas: &Arc<HashMap<String, ServiceSchema>>,
+    dag: &Arc<DagRuntime>,
+    orch: &Arc<Mutex<OrchestratorState>>,
+    autotest_stop_after_readiness: &Option<String>,
+) -> Result<(), SysXError> {
+    use std::os::unix::io::AsFd;
+
+    let mut buf = [0u8; 64];
+    let mut m = readiness_files
+        .lock()
+        .map_err(|e| SysXError::Reactor(format!("readiness lock: {}", e)))?;
+    let Some((name, file)) = m.get_mut(&fd) else {
+        return Ok(());
+    };
+    let name = name.clone();
+    match file.read(&mut buf) {
+        Ok(0) => {
+            drop(m);
+            let file = {
+                let mut m2 = readiness_files
+                    .lock()
+                    .map_err(|e| SysXError::Reactor(format!("readiness lock: {}", e)))?;
+                let Some((_, f)) = m2.remove(&fd) else {
+                    return Ok(());
+                };
+                f
+            };
+            let _ = epoll.delete(file.as_fd());
+            let was_starting = orch
+                .lock()
+                .map(|mut g| {
+                    let s = g.starting.remove(&name);
+                    let r = g.running.contains(&name);
+                    (s, r)
+                })
+                .unwrap_or((false, false));
+            if was_starting.0 && !was_starting.1 {
+                record_service_failed(&name, dag, orch);
+            }
+        }
+        Ok(n) if n > 0 => {
+            drop(m);
+            let first = orch
+                .lock()
+                .map(|g| !g.running.contains(&name))
+                .unwrap_or(false);
+            if first {
+                info!(
+                    "[SYSX] ORACLE_READINESS service={} bytes={} (FD3)",
+                    name, n
+                );
+                if let Ok(mut g) = orch.lock() {
+                    g.starting.remove(&name);
+                    g.running.insert(name.clone());
+                }
+                try_spawn_ready_services(
+                    rt,
+                    sealed,
+                    tombstoned,
+                    dfs_proven_dead,
+                    schemas,
+                    epoll,
+                    readiness_files,
+                    dag,
+                    orch,
+                );
+                if autotest_stop_after_readiness.as_deref() == Some(name.as_str()) {
+                    autotest_stop_after_readiness_fire(
+                        &name,
+                        rt,
+                        tombstoned,
+                        dfs_proven_dead,
+                        orch,
+                    );
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+        Err(e) => warn!("readiness read service={}: {}", name, e),
+    }
+    Ok(())
+}
+
+fn autotest_stop_after_readiness_fire(
+    name: &str,
+    rt: &RuntimeContext,
+    tombstoned: &Arc<Mutex<HashSet<String>>>,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
+    orch: &Arc<Mutex<OrchestratorState>>,
+) {
+    if is_tombstoned(tombstoned, name) {
+        return;
+    }
+    match stop_service(rt, name) {
+        Ok(StopOutcome::Dead) | Ok(StopOutcome::AlreadyGone) => {
+            if let Ok(mut g) = orch.lock() {
+                g.running.remove(name);
+                g.starting.remove(name);
+            }
+            info!(
+                "[SYSX] ORACLE_DFS_UNLINK_COMPLETE service={} (autotest stop)",
+                name
+            );
+            if let Ok(mut g) = dfs_proven_dead.lock() {
+                g.insert(name.to_string());
+            }
+        }
+        Ok(StopOutcome::Tombstoned) => {
+            let _ = orch.lock().map(|mut g| {
+                g.running.remove(name);
+                g.starting.remove(name);
+            });
+            info!(
+                "[SYSX] ORACLE_AUTOTEST_STOP_TOMBSTONED service={}",
+                name
+            );
+        }
+        Err(e) => error!("autotest stop service={}: {}", name, e),
     }
 }

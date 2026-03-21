@@ -7,6 +7,7 @@ use thiserror::Error;
 pub mod boot;
 pub mod cgroup_ops;
 pub mod dag;
+pub mod orchestration;
 pub mod reactor;
 pub mod schema_load;
 pub mod service_spawn;
@@ -16,6 +17,8 @@ pub mod terminal_broadcast;
 pub use boot::BootState;
 pub use boot::initialize as boot_initialize;
 pub use dag::validate as validate_dag;
+pub use dag::{forge_boot_order, DagRuntime, ForgedDag};
+pub use orchestration::OrchestratorState;
 pub use reactor::run as run_reactor;
 
 #[derive(Error, Debug)]
