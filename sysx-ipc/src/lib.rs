@@ -206,6 +206,8 @@ pub const STATUS_OFFLINE: u8 = 0x00;
 pub const STATUS_RUNNING: u8 = 0x02;
 /// §2.1.1 — cgroup exists, `populated=0`, directory not yet DFS-unlinked (`12` §3).
 pub const STATUS_SWEEPING: u8 = 0x03;
+/// §2.1.1 — **`Dead`** — `populated=0` **and** §4.1.1 DFS post-order unlink complete; sysfs path absent (`12` §3).
+pub const STATUS_DEAD_PRIMARY: u8 = 0x04;
 /// §2.1.1 — **`Failed`** primary state (`12` §2.1.1); byte1 = `FailureReason` (e.g. **`0x01`** Orphaned).
 pub const STATUS_FAILED_PRIMARY: u8 = 0x05;
 /// §2.1.1 — **`Tombstoned`** lifecycle state on **`Status`** (`12` §2.1.1, `16` §4); pair **`[0x06, 0x00]`**.

@@ -29,6 +29,9 @@ fn main() {
 }
 
 fn run() -> Result<(), SysXError> {
+    sysxd::boot::mount_pid1_essential()
+        .unwrap_or_else(|e| panic!("mount_pid1_essential failed: {}", e));
+
     let start = Instant::now();
 
     let rt = RuntimeContext::from_env();
@@ -57,9 +60,17 @@ fn run() -> Result<(), SysXError> {
             .collect(),
     );
     let tombstoned: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let dfs_proven_dead: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // Phase 3: Main reactor (`12` §2.2: epoll timeout and cgroup cap from sealed core.bin)
-    sysxd::reactor::run(boot.listener, &boot.core, &rt, tombstoned, schemas)?;
+    sysxd::reactor::run(
+        boot.listener,
+        &boot.core,
+        &rt,
+        tombstoned,
+        dfs_proven_dead,
+        schemas,
+    )?;
 
     info!("sysxd shutdown complete");
     Ok(())

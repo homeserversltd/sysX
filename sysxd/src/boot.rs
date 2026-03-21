@@ -1,5 +1,6 @@
 //! Boot sequence for sysxd - implements 04/17 ordering
 //!
+//! 0. **Early:** synchronous `proc` / `sysfs` / `cgroup2` mounts (`04` — PID 1 sovereignty)
 //! 1. Watchdog open (when present)
 //! 2. core.bin sealed cast within 10ms (`17` §4, `12` §2.2)
 //! 3. Control socket bind + chown with admin_gid from core.bin
@@ -12,6 +13,7 @@ use std::time::Instant;
 
 use log::{info, warn};
 use nix::fcntl::{open, OFlag};
+use nix::mount::{mount, MsFlags};
 use nix::sys::stat::Mode;
 use nix::unistd::{chown, Gid};
 use sysx_ipc::{decode_core_bin, SysxCoreBin, CORE_BIN_SIZE};
@@ -27,6 +29,61 @@ pub struct BootState {
 const WATCHDOG_PATH: &str = "/dev/watchdog";
 const CORE_BIN_PATH: &str = "/etc/sysx/core.bin";
 pub const CONTROL_SOCKET_PATH: &str = "/run/sysx/control.sock";
+
+/// Synchronous VFS setup for PID 1 **before** watchdog / `core.bin` (`04` §1). Panic on failure is enforced by caller.
+pub fn mount_pid1_essential() -> Result<(), SysXError> {
+    info!("mount_pid1_essential: proc, sysfs, cgroup2 (04 §1)");
+
+    let proc_ok = Path::new("/proc/self").exists();
+    if !proc_ok {
+        let _ = fs::create_dir_all("/proc");
+        mount(
+            Some("proc"),
+            "/proc",
+            Some("proc"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
+            None::<&str>,
+        )
+        .map_err(|e| SysXError::Boot(format!("mount proc: {}", e)))?;
+        info!("mounted proc on /proc");
+    } else {
+        info!("proc already present at /proc — skip mount");
+    }
+
+    let sys_ok = Path::new("/sys/kernel").exists();
+    if !sys_ok {
+        let _ = fs::create_dir_all("/sys");
+        mount(
+            Some("sysfs"),
+            "/sys",
+            Some("sysfs"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+            None::<&str>,
+        )
+        .map_err(|e| SysXError::Boot(format!("mount sysfs: {}", e)))?;
+        info!("mounted sysfs on /sys");
+    } else {
+        info!("sysfs already present — skip mount");
+    }
+
+    let cg = Path::new("/sys/fs/cgroup");
+    let _ = fs::create_dir_all(cg);
+    if !cg.join("cgroup.controllers").exists() {
+        mount(
+            Some("cgroup2"),
+            "/sys/fs/cgroup",
+            Some("cgroup2"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+            None::<&str>,
+        )
+        .map_err(|e| SysXError::Boot(format!("mount cgroup2: {}", e)))?;
+        info!("mounted cgroup2 on /sys/fs/cgroup");
+    } else {
+        info!("cgroup2 hierarchy already present — skip mount");
+    }
+
+    Ok(())
+}
 
 /// Initialize boot sequence per spec order 04/17. Returns bound control socket + decoded `core.bin`.
 pub fn initialize(_start: &Instant) -> Result<BootState, SysXError> {

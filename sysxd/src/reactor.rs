@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::sync::{Arc, Mutex};
 
@@ -20,8 +20,8 @@ use sysx_ipc::{
     decode_frame, encode_ipc_reply, peer_allowed_control, validate_peer_credentials, Command,
     FrameError, Header, SysxCoreBin, MAX_CONCURRENT_FDS, MAX_PAYLOAD_BYTES,
     OUTCOME_EPISTEMIC_CONFLICT, OUTCOME_SUCCESS, OUTCOME_TOMBSTONED, OUTCOME_UNAUTHORIZED,
-    OUTCOME_WIRE_PARSE, REASON_CGROUP_CAPACITY, REASON_NA, STATUS_OFFLINE, STATUS_REASON_NONE,
-    STATUS_RUNNING, STATUS_SWEEPING, STATUS_TOMBSTONED_PRIMARY,
+    OUTCOME_WIRE_PARSE, REASON_CGROUP_CAPACITY, REASON_NA, STATUS_DEAD_PRIMARY, STATUS_OFFLINE,
+    STATUS_REASON_NONE, STATUS_RUNNING, STATUS_SWEEPING, STATUS_TOMBSTONED_PRIMARY,
 };
 use sysx_schema::ServiceSchema;
 use sysx_runtime::{
@@ -29,7 +29,7 @@ use sysx_runtime::{
 };
 
 use crate::cgroup_ops::{ensure_start_cgroup, StartCgroupError};
-use crate::service_spawn::spawn_simple_service;
+use crate::service_spawn::{spawn_simple_service, SpawnOutcome};
 use crate::stop_ladder::{dfs_post_order_rmdir, stop_service, StopOutcome};
 use crate::terminal_broadcast::{
     run_terminal_broadcast, TerminalBroadcastKind,
@@ -59,6 +59,7 @@ pub fn run(
     sealed: &SysxCoreBin,
     rt: &RuntimeContext,
     tombstoned: Arc<Mutex<HashSet<String>>>,
+    dfs_proven_dead: Arc<Mutex<HashSet<String>>>,
     schemas: Arc<HashMap<String, ServiceSchema>>,
 ) -> Result<(), SysXError> {
     listener
@@ -100,6 +101,49 @@ pub fn run(
         })?;
     }
 
+    let mut wake_pipe = [0i32; 2];
+    unsafe {
+        if libc::pipe(wake_pipe.as_mut_ptr()) != 0 {
+            return Err(SysXError::Reactor(format!(
+                "reaper wake pipe: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    let wake_r = wake_pipe[0];
+    let wake_w = wake_pipe[1];
+    unsafe {
+        let fl = libc::fcntl(wake_r, libc::F_GETFL);
+        if fl >= 0 {
+            let _ = libc::fcntl(wake_r, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+    }
+    let mut wake_file = unsafe { std::fs::File::from_raw_fd(wake_r) };
+    let wake_ev = EpollEvent::new(EpollFlags::EPOLLIN, wake_file.as_raw_fd() as u64);
+    epoll
+        .add(&wake_file, wake_ev)
+        .map_err(|e| SysXError::Reactor(format!("epoll add reaper wake pipe: {}", e)))?;
+
+    let readiness_files: Arc<Mutex<HashMap<RawFd, (String, std::fs::File)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    #[cfg(target_os = "linux")]
+    {
+        let slice_root = crate::terminal_broadcast::sysx_slice_root(rt);
+        let ww = wake_w;
+        let _h = sysx_reaper::spawn_slice_observer(slice_root, move |name| {
+            let line = format!("{}\n", name);
+            if let Err(e) = nix::unistd::write(
+                unsafe { BorrowedFd::borrow_raw(ww) },
+                line.as_bytes(),
+            ) {
+                warn!("reaper wake write: {}", e);
+            }
+        })
+        .map_err(|e| SysXError::Reactor(format!("spawn_slice_observer: {}", e)))?;
+        let _ = _h;
+    }
+
     let epoll_ms = u32::from(sealed.epoll_timeout_ms);
     let epoll_timeout = EpollTimeout::try_from(epoll_ms).map_err(|e| {
         SysXError::Reactor(format!(
@@ -119,6 +163,8 @@ pub fn run(
         MAX_CONCURRENT_FDS
     );
     info!("SYSX_ORACLE_REACTOR_READY (11 serial oracle)");
+
+    let wake_fd = wake_file.as_raw_fd();
 
     loop {
         poll_assembly_timeouts(
@@ -153,6 +199,23 @@ pub fn run(
                         if let Some(ref sfd) = sigpwr {
                             on_sigpwr_signalfd(sfd, rt);
                         }
+                    } else if fd == wake_fd {
+                        drain_reaper_wake_pipe(
+                            &mut wake_file,
+                            rt,
+                            &dfs_proven_dead,
+                            &tombstoned,
+                        )?;
+                    } else if readiness_files
+                        .lock()
+                        .map(|m| m.contains_key(&fd))
+                        .unwrap_or(false)
+                    {
+                        handle_readiness_fd(
+                            fd,
+                            &readiness_files,
+                            &epoll,
+                        )?;
                     } else {
                         on_client_readable(
                             &epoll,
@@ -165,7 +228,9 @@ pub fn run(
                             sealed,
                             rt,
                             &tombstoned,
+                            &dfs_proven_dead,
                             &schemas,
+                            &readiness_files,
                         )?;
                     }
                 }
@@ -365,7 +430,9 @@ fn on_client_readable(
     sealed: &SysxCoreBin,
     rt: &RuntimeContext,
     tombstoned: &Arc<Mutex<HashSet<String>>>,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
     schemas: &Arc<HashMap<String, ServiceSchema>>,
+    readiness_files: &Arc<Mutex<HashMap<RawFd, (String, std::fs::File)>>>,
 ) -> Result<(), SysXError> {
     if clients.get(&fd).is_none() {
         warn!("epoll event for unknown fd {}", fd);
@@ -451,7 +518,10 @@ fn on_client_readable(
                     sealed,
                     rt,
                     tombstoned,
+                    dfs_proven_dead,
                     schemas,
+                    epoll,
+                    readiness_files,
                 );
             }
             maybe_resume_listener(epoll, listener, listen_fd, listener_in_epoll, clients.len())?;
@@ -469,32 +539,123 @@ fn on_client_readable(
     Ok(())
 }
 
-fn status_from_kernel(rt: &RuntimeContext, name: &str) -> (u8, u8) {
+fn drain_reaper_wake_pipe(
+    wake_file: &mut std::fs::File,
+    rt: &RuntimeContext,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
+    tombstoned: &Arc<Mutex<HashSet<String>>>,
+) -> Result<(), SysXError> {
+    let mut buf = [0u8; 512];
+    loop {
+        match wake_file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = String::from_utf8_lossy(&buf[..n]);
+                for line in chunk.lines() {
+                    let name = line.trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    apply_reaper_dfs(rt, name, dfs_proven_dead, tombstoned);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) => {
+                return Err(SysXError::Reactor(format!("reaper wake read: {}", e)));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_reaper_dfs(
+    rt: &RuntimeContext,
+    name: &str,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
+    tombstoned: &Arc<Mutex<HashSet<String>>>,
+) {
+    if validate_ipc_service_name(name).is_err() {
+        return;
+    }
+    let path = match rt.service_cgroup_path(name) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    match dfs_post_order_rmdir(&path) {
+        Ok(()) => {
+            if let Ok(mut g) = dfs_proven_dead.lock() {
+                g.insert(name.to_string());
+            }
+            if let Ok(mut t) = tombstoned.lock() {
+                t.remove(name);
+            }
+            info!("reaper DFS unlink OK service={} (12 §4.1.1)", name);
+        }
+        Err(e) => error!("reaper DFS failed service={}: {}", name, e),
+    }
+}
+
+fn handle_readiness_fd(
+    fd: RawFd,
+    readiness_files: &Arc<Mutex<HashMap<RawFd, (String, std::fs::File)>>>,
+    _epoll: &Epoll,
+) -> Result<(), SysXError> {
+    let mut buf = [0u8; 64];
+    let mut m = readiness_files
+        .lock()
+        .map_err(|e| SysXError::Reactor(format!("readiness lock: {}", e)))?;
+    if let Some((name, file)) = m.get_mut(&fd) {
+        match file.read(&mut buf) {
+            Ok(n) => info!("readiness FD3 n={} service={}", n, name),
+            Err(e) => warn!("readiness read service={}: {}", name, e),
+        }
+    }
+    Ok(())
+}
+
+/// `12` §3 / §4.1.1: **`Dead`** only when cgroup path is **absent** and supervisor has **DFS proof**
+/// (`dfs_proven_dead`). While directory exists and `populated=0`, state is **`Sweeping`** (empty-but-pinned).
+fn evaluate_status_abi(
+    rt: &RuntimeContext,
+    name: &str,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
+) -> (u8, u8) {
     let cgroup_dir = match rt.service_cgroup_path(name) {
         Ok(p) => p,
         Err(_) => return (STATUS_OFFLINE, STATUS_REASON_NONE),
     };
-    if !cgroup_dir.exists() {
-        return (STATUS_OFFLINE, STATUS_REASON_NONE);
-    }
-    let events_path = match rt.cgroup_events_path(name) {
-        Ok(p) => p,
-        Err(_) => return (STATUS_OFFLINE, STATUS_REASON_NONE),
-    };
-    match read_sysfs_cgroup_populated(&events_path) {
-        Ok(Some(true)) => (STATUS_RUNNING, STATUS_REASON_NONE),
-        Ok(Some(false)) => (STATUS_SWEEPING, STATUS_REASON_NONE),
-        Ok(None) => {
-            error!(
-                "cgroup.events missing under existing cgroup dir {}",
-                cgroup_dir.display()
-            );
-            (STATUS_OFFLINE, STATUS_REASON_NONE)
+
+    if cgroup_dir.exists() {
+        let _ = dfs_proven_dead.lock().map(|mut g| {
+            g.remove(name);
+        });
+        let events_path = match rt.cgroup_events_path(name) {
+            Ok(p) => p,
+            Err(_) => return (STATUS_OFFLINE, STATUS_REASON_NONE),
+        };
+        match read_sysfs_cgroup_populated(&events_path) {
+            Ok(Some(true)) => (STATUS_RUNNING, STATUS_REASON_NONE),
+            Ok(Some(false)) => (STATUS_SWEEPING, STATUS_REASON_NONE),
+            Ok(None) => {
+                error!(
+                    "cgroup.events missing under existing cgroup dir {}",
+                    cgroup_dir.display()
+                );
+                (STATUS_OFFLINE, STATUS_REASON_NONE)
+            }
+            Err(e) => {
+                error!("read cgroup.events {}: {}", events_path.display(), e);
+                (STATUS_OFFLINE, STATUS_REASON_NONE)
+            }
         }
-        Err(e) => {
-            error!("read cgroup.events {}: {}", events_path.display(), e);
-            (STATUS_OFFLINE, STATUS_REASON_NONE)
-        }
+    } else if dfs_proven_dead
+        .lock()
+        .map(|g| g.contains(name))
+        .unwrap_or(false)
+    {
+        (STATUS_DEAD_PRIMARY, STATUS_REASON_NONE)
+    } else {
+        (STATUS_OFFLINE, STATUS_REASON_NONE)
     }
 }
 
@@ -505,16 +666,17 @@ fn is_tombstoned(tombstoned: &Arc<Mutex<HashSet<String>>>, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// `Command::Status` — kernel sysfs plus in-reactor **`Tombstoned`** set (`16` §4).
+/// `Command::Status` — `16` §4 **`Tombstoned`**, then `12` §2.1.1 epistemic + sysfs.
 fn status_reply(
     rt: &RuntimeContext,
     name: &str,
     tombstoned: &Arc<Mutex<HashSet<String>>>,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
 ) -> (u8, u8) {
     if is_tombstoned(tombstoned, name) {
         return (STATUS_TOMBSTONED_PRIMARY, STATUS_REASON_NONE);
     }
-    status_from_kernel(rt, name)
+    evaluate_status_abi(rt, name, dfs_proven_dead)
 }
 
 fn sysfs_populated_label(rt: &RuntimeContext, name: &str) -> &'static str {
@@ -536,8 +698,9 @@ fn status_sysfs_matches_ipc(
     ipc_b0: u8,
     ipc_b1: u8,
     tombstoned: &Arc<Mutex<HashSet<String>>>,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
 ) -> u8 {
-    let k = status_reply(rt, name, tombstoned);
+    let k = status_reply(rt, name, tombstoned, dfs_proven_dead);
     u8::from(k.0 == ipc_b0 && k.1 == ipc_b1)
 }
 
@@ -550,10 +713,18 @@ fn log_oracle_dual(
     ipc_b1: u8,
     rt: &RuntimeContext,
     tombstoned: &Arc<Mutex<HashSet<String>>>,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
 ) {
     let sysfs_pop = sysfs_populated_label(rt, name);
     if hdr_cmd == Command::Status {
-        let m = status_sysfs_matches_ipc(rt, name, ipc_b0, ipc_b1, tombstoned);
+        let m = status_sysfs_matches_ipc(
+            rt,
+            name,
+            ipc_b0,
+            ipc_b1,
+            tombstoned,
+            dfs_proven_dead,
+        );
         info!(
             "SYSX_ORACLE_DUAL op={} service={} ipc=S:0x{:02x}:R:0x{:02x} sysfs_populated={} sysfs_match={} (11)",
             op, name, ipc_b0, ipc_b1, sysfs_pop, m
@@ -573,7 +744,10 @@ fn dispatch_ipc(
     sealed: &SysxCoreBin,
     rt: &RuntimeContext,
     tombstoned: &Arc<Mutex<HashSet<String>>>,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
     schemas: &Arc<HashMap<String, ServiceSchema>>,
+    epoll: &Epoll,
+    readiness_files: &Arc<Mutex<HashMap<RawFd, (String, std::fs::File)>>>,
 ) {
     let plen = payload.len();
     match hdr.command {
@@ -635,6 +809,7 @@ fn dispatch_ipc(
                     REASON_NA,
                     rt,
                     tombstoned,
+                    dfs_proven_dead,
                 );
                 return;
             }
@@ -650,20 +825,24 @@ fn dispatch_ipc(
                     if let Ok(mut g) = tombstoned.lock() {
                         g.remove(name);
                     }
+                    if let Ok(mut g) = dfs_proven_dead.lock() {
+                        g.remove(name);
+                    }
                     info!("Reset {:?}: DFS cleared — Tombstoned cleared (16 §4)", name);
                     let out = encode_ipc_reply(hdr.command, OUTCOME_SUCCESS, REASON_NA);
                     if let Err(e) = sock.write_all(&out) {
                         error!("reply write failed: {}", e);
                     }
-                    log_oracle_dual(
-                        "reset",
-                        name,
-                        Command::Reset,
-                        OUTCOME_SUCCESS,
-                        REASON_NA,
-                        rt,
-                        tombstoned,
-                    );
+                log_oracle_dual(
+                    "reset",
+                    name,
+                    Command::Reset,
+                    OUTCOME_SUCCESS,
+                    REASON_NA,
+                    rt,
+                    tombstoned,
+                    dfs_proven_dead,
+                );
                 }
                 Err(e) => {
                     error!("Reset {:?}: DFS unlink failed: {} (EBUSY path 16 §4)", name, e);
@@ -679,6 +858,7 @@ fn dispatch_ipc(
                         REASON_NA,
                         rt,
                         tombstoned,
+                        dfs_proven_dead,
                     );
                 }
             }
@@ -713,6 +893,7 @@ fn dispatch_ipc(
                     REASON_NA,
                     rt,
                     tombstoned,
+                    dfs_proven_dead,
                 );
                 return;
             }
@@ -720,13 +901,35 @@ fn dispatch_ipc(
                 Ok(()) => {
                     if let Some(schema) = schemas.get(name) {
                         match spawn_simple_service(rt, schema) {
-                            Ok(()) => (OUTCOME_SUCCESS, REASON_NA),
+                            Ok(outcome) => {
+                                if let Ok(mut g) = dfs_proven_dead.lock() {
+                                    g.remove(name);
+                                }
+                                let SpawnOutcome { readiness_read } = outcome;
+                                let rfd = readiness_read.as_raw_fd();
+                                let ev = EpollEvent::new(
+                                    EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP,
+                                    rfd as u64,
+                                );
+                                if let Ok(mut m) = readiness_files.lock() {
+                                    m.insert(rfd, (name.to_string(), readiness_read));
+                                    if let Some((_, f)) = m.get(&rfd) {
+                                        if let Err(e) = epoll.add(f, ev) {
+                                            error!("epoll add readiness fd={}: {}", rfd, e);
+                                        }
+                                    }
+                                }
+                                (OUTCOME_SUCCESS, REASON_NA)
+                            }
                             Err(e) => {
                                 error!("Start {:?}: spawn failed: {}", name, e);
                                 (OUTCOME_EPISTEMIC_CONFLICT, REASON_NA)
                             }
                         }
                     } else {
+                        if let Ok(mut g) = dfs_proven_dead.lock() {
+                            g.remove(name);
+                        }
                         (OUTCOME_SUCCESS, REASON_NA)
                     }
                 }
@@ -750,7 +953,16 @@ fn dispatch_ipc(
             if let Err(e) = sock.write_all(&out) {
                 error!("reply write failed: {}", e);
             }
-            log_oracle_dual("start", name, Command::Start, b0, b1, rt, tombstoned);
+            log_oracle_dual(
+                "start",
+                name,
+                Command::Start,
+                b0,
+                b1,
+                rt,
+                tombstoned,
+                dfs_proven_dead,
+            );
         }
         Command::Stop => {
             if hdr.payload_length == 0 || plen == 0 {
@@ -782,6 +994,7 @@ fn dispatch_ipc(
                     REASON_NA,
                     rt,
                     tombstoned,
+                    dfs_proven_dead,
                 );
                 return;
             }
@@ -790,6 +1003,9 @@ fn dispatch_ipc(
                     info!("Stop {:?}: AlreadyGone (12 §4)", name);
                     if let Ok(mut g) = tombstoned.lock() {
                         g.remove(name);
+                    }
+                    if let Ok(mut g) = dfs_proven_dead.lock() {
+                        g.insert(name.to_string());
                     }
                     (OUTCOME_SUCCESS, REASON_NA)
                 }
@@ -800,6 +1016,9 @@ fn dispatch_ipc(
                     );
                     if let Ok(mut g) = tombstoned.lock() {
                         g.remove(name);
+                    }
+                    if let Ok(mut g) = dfs_proven_dead.lock() {
+                        g.insert(name.to_string());
                     }
                     (OUTCOME_SUCCESS, REASON_NA)
                 }
@@ -822,7 +1041,16 @@ fn dispatch_ipc(
             if let Err(e) = sock.write_all(&out) {
                 error!("reply write failed: {}", e);
             }
-            log_oracle_dual("stop", name, Command::Stop, b0, b1, rt, tombstoned);
+            log_oracle_dual(
+                "stop",
+                name,
+                Command::Stop,
+                b0,
+                b1,
+                rt,
+                tombstoned,
+                dfs_proven_dead,
+            );
         }
         Command::Status => {
             if hdr.payload_length == 0 || plen == 0 {
@@ -840,16 +1068,25 @@ fn dispatch_ipc(
                 reply_pre_dispatch_error(sock, OUTCOME_WIRE_PARSE, REASON_NA);
                 return;
             }
-            let (b0, b1) = status_reply(rt, name, tombstoned);
+            let (b0, b1) = status_reply(rt, name, tombstoned, dfs_proven_dead);
             info!(
-                "Status {:?} -> [S:{:#04x}, R:{:#04x}] (tombstone+kernel sysfs)",
+                "Status {:?} -> [S:{:#04x}, R:{:#04x}] (12 §2.1.1)",
                 name, b0, b1
             );
             let out = encode_ipc_reply(Command::Status, b0, b1);
             if let Err(e) = sock.write_all(&out) {
                 error!("reply write failed: {}", e);
             }
-            log_oracle_dual("status", name, Command::Status, b0, b1, rt, tombstoned);
+            log_oracle_dual(
+                "status",
+                name,
+                Command::Status,
+                b0,
+                b1,
+                rt,
+                tombstoned,
+                dfs_proven_dead,
+            );
         }
     }
 }
