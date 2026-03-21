@@ -3,10 +3,10 @@ members = [
     "sysx-ipc",
     "sysx-schema",
     "sysx-compiler",
+    "sysx-runtime",
     "sysx-reaper",
     "sysxd",
     "sysx-cli",
-    # "sysx-runtime",  # not present in current tree (per track 9 stitch)
 ]
 resolver = "2"
 
@@ -26,6 +26,7 @@ panic = "abort"
 [workspace.dependencies]
 sysx-ipc = { path = "sysx-ipc" }
 sysx-schema = { path = "sysx-schema" }
+sysx-runtime = { path = "sysx-runtime" }
 sysx-reaper = { path = "sysx-reaper" }
 nix = { version = "0.29", features = ["fs", "signal", "socket", "uio", "ioctl", "event"] }
 tokio = { version = "1", features = ["full"] }

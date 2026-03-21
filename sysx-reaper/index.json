@@ -1,0 +1,14 @@
+{
+  "metadata": {
+    "schema_version": 1,
+    "name": "sysx-reaper",
+    "description": "cgroup.events epoll, sweep coordination"
+  },
+  "paths": {
+    "lib": "src/lib.rs",
+    "main": "src/main.rs"
+  },
+  "children": [],
+  "execution": "sequential",
+  "config": {}
+}

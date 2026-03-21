@@ -10,7 +10,7 @@
     "sysx-reaper": "ready",
     "sysx-ipc": "ready",
     "sysx-cli": "pending",
-    "sysx-runtime": "pending"
+    "sysx-runtime": "ready"
   },
   "metadata": {
     "schema_version": 1,

@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "schema_version": 1,
+    "name": "sysx-schema",
+    "description": "Service YAML schema and normalized types"
+  },
+  "paths": {
+    "lib": "src/lib.rs"
+  },
+  "children": [],
+  "execution": "sequential",
+  "config": {}
+}

@@ -32,9 +32,9 @@ fn build_dependency_graph(schemas: &[ServiceSchema]) -> HashMap<String, Vec<Stri
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
 
     for schema in schemas {
-        graph.entry(schema.name.clone()).or_default();
+        graph.entry(schema.service.name.clone()).or_default();
         for dep in &schema.depends_on {
-            graph.entry(schema.name.clone()).or_default().push(dep.clone());
+            graph.entry(schema.service.name.clone()).or_default().push(dep.clone());
             graph.entry(dep.clone()).or_default();
         }
     }

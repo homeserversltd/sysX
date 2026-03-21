@@ -1,9 +1,27 @@
 {
-  "name": "sysX",
-  "description": "Deterministic PID 1 for sovereign infrastructure. cgroup v2 supervisor with strict YAML schema, binary IPC, and kernel-grounded lifecycle per docs/memories/ongoing/sysX/",
-  "version": "0.1.0",
-  "schema_version": 1,
-  "type": "workspace",
+  "metadata": {
+    "schema_version": 1,
+    "name": "sysX",
+    "description": "Deterministic PID 1 cgroup supervisor workspace"
+  },
+  "paths": {
+    "state_file": "state.json",
+    "schema_dir": "sysx-schema",
+    "cgroup_root": "/sys/fs/cgroup"
+  },
+  "children": [
+    "sysx-ipc",
+    "sysx-schema",
+    "sysx-compiler",
+    "sysx-runtime",
+    "sysx-reaper",
+    "sysxd",
+    "sysx-cli"
+  ],
+  "execution": "sequential",
+  "config": {
+    "ipc_wire_version": 1
+  },
   "components": {
     "sysxd": {
       "path": "sysxd",

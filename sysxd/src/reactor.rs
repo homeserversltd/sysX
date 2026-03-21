@@ -22,7 +22,7 @@ pub fn run() -> Result<(), SysXError> {
     // Main event loop
     loop {
         let mut events = [EpollEvent::empty(); 16];
-        match epoll.wait(&mut events, EpollTimeout::Milliseconds(1000)) {
+        match epoll.wait(&mut events, EpollTimeout::try_from(1000_u32).unwrap()) {
             Ok(n) => {
                 if n == 0 {
                     // timeout - could do periodic health checks here

@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "schema_version": 1,
+    "name": "sysx-runtime",
+    "description": "Cgroup/namespace policy and fork/exec choreography"
+  },
+  "paths": {
+    "lib": "src/lib.rs"
+  },
+  "children": [],
+  "execution": "sequential",
+  "config": {}
+}

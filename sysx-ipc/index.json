@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "schema_version": 1,
+    "name": "sysx-ipc",
+    "description": "Binary IPC framing, SO_PEERCRED, shared wire types"
+  },
+  "paths": {
+    "lib": "src/lib.rs"
+  },
+  "children": [],
+  "execution": "sequential",
+  "config": {}
+}

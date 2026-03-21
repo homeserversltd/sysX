@@ -1,0 +1,14 @@
+{
+  "metadata": {
+    "schema_version": 1,
+    "name": "sysx-compiler",
+    "description": "YAML/IR to artifacts and core.bin forger"
+  },
+  "paths": {
+    "lib": "src/lib.rs",
+    "main": "src/main.rs"
+  },
+  "children": [],
+  "execution": "sequential",
+  "config": {}
+}

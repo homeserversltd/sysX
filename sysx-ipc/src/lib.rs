@@ -6,6 +6,7 @@
 //!
 //! Commands 0x10-0x60 are the canonical command space.
 
+use std::os::fd::BorrowedFd;
 use std::os::unix::io::RawFd;
 use nix::sys::socket::UnixCredentials;
 use thiserror::Error;
@@ -192,11 +193,12 @@ impl Message {
 
 /// SO_PEERCRED based peer validation contract
 pub fn validate_peer_credentials(fd: RawFd) -> Result<UnixCredentials, FrameError> {
-    // In real implementation this would use nix::sys::socket::getsockopt with SO_PEERCRED
-    // For now we return a placeholder that satisfies the contract
-    // Real validation happens in the control socket acceptor
-    nix::sys::socket::getsockopt(fd, nix::sys::socket::sockopt::PeerCredentials)
-        .map_err(|_| FrameError::CredValidationFailed)
+    // SO_PEERCRED via getsockopt (nix 0.29 expects AsFd — use BorrowedFd::borrow_raw)
+    unsafe {
+        let borrowed = BorrowedFd::borrow_raw(fd);
+        nix::sys::socket::getsockopt(&borrowed, nix::sys::socket::sockopt::PeerCredentials)
+            .map_err(|_| FrameError::CredValidationFailed)
+    }
 }
 
 /// Configuration type that carries epoll_timeout_ms from core.bin

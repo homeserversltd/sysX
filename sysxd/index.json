@@ -1,0 +1,14 @@
+{
+  "metadata": {
+    "schema_version": 1,
+    "name": "sysxd",
+    "description": "PID 1 supervisor binary"
+  },
+  "paths": {
+    "main": "src/main.rs",
+    "lib": "src/lib.rs"
+  },
+  "children": [],
+  "execution": "sequential",
+  "config": {}
+}

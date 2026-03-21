@@ -7,33 +7,14 @@
 //! 4. Pre-reactor DAG Kahn sort + cycle/depth validation (max 16)
 //! 5. Main reactor (epoll_wait on control socket + cgroup.events)
 
-use std::os::unix::io::RawFd;
-use std::path::Path;
 use std::time::Instant;
 
-use log::{error, info, warn};
-use nix::sys::stat::Mode;
-use nix::unistd::{chown, Gid};
-use thiserror::Error;
+use log::{error, info};
 
-use sysx_ipc::{Command, SYSX_MAGIC, SYSX_VERSION};
+use sysx_runtime::RuntimeContext;
 use sysx_schema::ServiceSchema;
 
-mod boot;
-mod reactor;
-mod dag;
-
-#[derive(Error, Debug)]
-pub enum SysXError {
-    #[error("Boot failed: {0}")]
-    Boot(String),
-    #[error("DAG validation failed: {0}")]
-    Dag(String),
-    #[error("Reactor error: {0}")]
-    Reactor(String),
-    #[error("IPC error: {0}")]
-    Ipc(#[from] sysx_ipc::Error),
-}
+use sysxd::SysXError;
 
 /// Entry point for sysxd PID 1 supervisor
 fn main() {
@@ -49,15 +30,23 @@ fn main() {
 fn run() -> Result<(), SysXError> {
     let start = Instant::now();
 
+    let rt = RuntimeContext::from_env();
+    info!(
+        "sysx-runtime {} cgroup_root={} slice={}",
+        sysx_runtime::VERSION,
+        rt.cgroup_root.display(),
+        rt.service_slice
+    );
+
     // Phase 1: Boot sequence per 04-runtime-reaper-and-sweep-guarantee.md and 17-sealed-boot-core-bin.md
-    boot::initialize(&start)?;
+    sysxd::boot::initialize(&start)?;
 
     // Phase 2: Pre-reactor DAG validation (Kahn topological sort, cycle detection, max depth 16)
     let schemas = load_schemas()?;
-    dag::validate(&schemas)?;
+    sysxd::dag::validate(&schemas)?;
 
     // Phase 3: Main reactor wiring
-    reactor::run()?;
+    sysxd::reactor::run()?;
 
     info!("sysxd shutdown complete");
     Ok(())
