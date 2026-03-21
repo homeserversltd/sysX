@@ -1,0 +1,29 @@
+{
+  "name": "sysX",
+  "description": "Deterministic PID 1 for sovereign infrastructure. cgroup v2 supervisor with strict YAML schema, binary IPC, and kernel-grounded lifecycle per docs/memories/ongoing/sysX/",
+  "version": "0.1.0",
+  "schema_version": 1,
+  "type": "workspace",
+  "components": {
+    "sysxd": {
+      "path": "sysxd",
+      "type": "binary",
+      "description": "Main PID 1 replacement daemon"
+    },
+    "sysx-compiler": {
+      "path": "sysx-compiler",
+      "type": "binary",
+      "description": "YAML schema compiler and core.bin forger"
+    },
+    "sysx-cli": {
+      "path": "sysx-cli",
+      "type": "binary",
+      "description": "CLI for sysX control socket"
+    }
+  },
+  "state": {
+    "status": "initialized",
+    "last_updated": "2026-03-21",
+    "phase": "bootstrap"
+  }
+}

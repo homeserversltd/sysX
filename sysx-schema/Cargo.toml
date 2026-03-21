@@ -1,0 +1,11 @@
+[package]
+name = "sysx-schema"
+version = "0.1.0"
+edition = "2021"
+description = "SysX ServiceSchema and YAML parser with strict unknown fields validation per 15-schema-contract-v1.md"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "1.0"

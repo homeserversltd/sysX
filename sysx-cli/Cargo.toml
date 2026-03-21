@@ -1,0 +1,15 @@
+[package]
+name = "sysx-cli"
+version = "0.1.0"
+edition = "2021"
+description = "SysX CLI for controlling the cgroup supervisor via binary IPC"
+authors = ["HOMESERVER LLC"]
+license = "AGPL-3.0"
+repository = "https://github.com/homeserverllc/sysX"
+
+[dependencies]
+sysx-ipc = { path = "../sysx-ipc" }
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1.0"
+thiserror = "1.0"

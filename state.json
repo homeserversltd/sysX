@@ -1,0 +1,20 @@
+{
+  "version": "0.1.0",
+  "status": "initialized",
+  "phase": "bootstrap",
+  "last_updated": "2026-03-21T22:00:00Z",
+  "components": {
+    "sysxd": "pending",
+    "sysx-schema": "ready",
+    "sysx-compiler": "ready",
+    "sysx-reaper": "ready",
+    "sysx-ipc": "ready",
+    "sysx-cli": "pending",
+    "sysx-runtime": "pending"
+  },
+  "metadata": {
+    "schema_version": 1,
+    "cgroup_v2": true,
+    "ipc_wire_version": 1
+  }
+}
