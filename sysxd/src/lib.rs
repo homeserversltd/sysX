@@ -5,6 +5,7 @@
 use thiserror::Error;
 
 pub mod boot;
+pub mod cgroup_ops;
 pub mod dag;
 pub mod reactor;
 pub mod terminal_broadcast;

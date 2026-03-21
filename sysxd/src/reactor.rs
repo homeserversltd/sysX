@@ -17,14 +17,16 @@ use log::{error, info, warn};
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use sysx_ipc::{
     decode_frame, encode_ipc_reply, peer_allowed_control, validate_peer_credentials, Command,
-    FrameError, Header, SysxCoreBin, MAX_CONCURRENT_FDS, MAX_PAYLOAD_BYTES, OUTCOME_SUCCESS,
-    OUTCOME_UNAUTHORIZED, OUTCOME_WIRE_PARSE, REASON_NA, STATUS_OFFLINE, STATUS_REASON_NONE,
-    STATUS_RUNNING, STATUS_SWEEPING,
+    FrameError, Header, SysxCoreBin, MAX_CONCURRENT_FDS, MAX_PAYLOAD_BYTES,
+    OUTCOME_EPISTEMIC_CONFLICT, OUTCOME_SUCCESS, OUTCOME_UNAUTHORIZED, OUTCOME_WIRE_PARSE,
+    REASON_CGROUP_CAPACITY, REASON_NA, STATUS_OFFLINE, STATUS_REASON_NONE, STATUS_RUNNING,
+    STATUS_SWEEPING,
 };
 use sysx_runtime::{
     read_sysfs_cgroup_populated, validate_ipc_service_name, RuntimeContext,
 };
 
+use crate::cgroup_ops::{ensure_start_cgroup, StartCgroupError};
 use crate::terminal_broadcast::{
     run_terminal_broadcast, TerminalBroadcastKind,
 };
@@ -481,7 +483,7 @@ fn dispatch_ipc(
     sock: &mut impl Write,
     hdr: &Header,
     payload: &[u8],
-    _sealed: &SysxCoreBin,
+    sealed: &SysxCoreBin,
     rt: &RuntimeContext,
 ) {
     let plen = payload.len();
@@ -532,7 +534,45 @@ fn dispatch_ipc(
                 error!("reply write failed: {}", e);
             }
         }
-        Command::Start | Command::Stop => {
+        Command::Start => {
+            if hdr.payload_length == 0 || plen == 0 {
+                reply_pre_dispatch_error(sock, OUTCOME_WIRE_PARSE, REASON_NA);
+                return;
+            }
+            let name = match str::from_utf8(payload) {
+                Ok(s) => s,
+                Err(_) => {
+                    reply_pre_dispatch_error(sock, OUTCOME_WIRE_PARSE, REASON_NA);
+                    return;
+                }
+            };
+            if validate_ipc_service_name(name).is_err() {
+                reply_pre_dispatch_error(sock, OUTCOME_WIRE_PARSE, REASON_NA);
+                return;
+            }
+            let (b0, b1) = match ensure_start_cgroup(rt, name, sealed.max_cgroups) {
+                Ok(()) => (OUTCOME_SUCCESS, REASON_NA),
+                Err(StartCgroupError::AtCapacity { used, max }) => {
+                    info!(
+                        "Start {:?}: reply [S:{:#04x}, R:{:#04x}] capacity used={} max={} (12 §2.2)",
+                        name,
+                        OUTCOME_EPISTEMIC_CONFLICT,
+                        REASON_CGROUP_CAPACITY,
+                        used,
+                        max
+                    );
+                    (OUTCOME_EPISTEMIC_CONFLICT, REASON_CGROUP_CAPACITY)
+                }
+                Err(StartCgroupError::Mkdir(_)) => {
+                    (OUTCOME_EPISTEMIC_CONFLICT, REASON_NA)
+                }
+            };
+            let out = encode_ipc_reply(Command::Start, b0, b1);
+            if let Err(e) = sock.write_all(&out) {
+                error!("reply write failed: {}", e);
+            }
+        }
+        Command::Stop => {
             if hdr.payload_length == 0 || plen == 0 {
                 reply_pre_dispatch_error(sock, OUTCOME_WIRE_PARSE, REASON_NA);
                 return;
