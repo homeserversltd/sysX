@@ -9,6 +9,7 @@ pub mod cgroup_ops;
 pub mod dag;
 pub mod reactor;
 pub mod schema_load;
+pub mod service_spawn;
 pub mod stop_ladder;
 pub mod terminal_broadcast;
 

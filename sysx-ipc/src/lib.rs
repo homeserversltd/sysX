@@ -199,13 +199,20 @@ pub const REASON_NA: u8 = 0x00;
 /// §2.1 **`reason_code`** **`0x06`** — cgroup capacity (**`max_cgroups`** from **`core.bin`**) with **`status_code`** **`0x04`** (`12` §2.2).
 pub const REASON_CGROUP_CAPACITY: u8 = 0x06;
 
-/// §2.1.1 Status primary states (`byte0`).
+/// §2.1.1 Status primary states (`byte0`). **Only** `Command::Status` uses this table (`12` §2.1.1).
+/// Note: **`0x05` / `0x06` here are lifecycle states**, not `§2.1` outcome `Tombstoned` (`0x05` on Stop).
 pub const STATUS_OFFLINE: u8 = 0x00;
 /// §2.1.1 Status reply: primary state `Running`, no secondary reason.
 pub const STATUS_RUNNING: u8 = 0x02;
 /// §2.1.1 — cgroup exists, `populated=0`, directory not yet DFS-unlinked (`12` §3).
 pub const STATUS_SWEEPING: u8 = 0x03;
+/// §2.1.1 — **`Failed`** primary state (`12` §2.1.1); byte1 = `FailureReason` (e.g. **`0x01`** Orphaned).
+pub const STATUS_FAILED_PRIMARY: u8 = 0x05;
+/// §2.1.1 — **`Tombstoned`** lifecycle state on **`Status`** (`12` §2.1.1, `16` §4); pair **`[0x06, 0x00]`**.
+pub const STATUS_TOMBSTONED_PRIMARY: u8 = 0x06;
 pub const STATUS_REASON_NONE: u8 = 0x00;
+/// §2.1.1 — **`Failed`** + **`Orphaned`** (`11` dual-oracle / `12` §2.1.1 reason column).
+pub const STATUS_REASON_ORPHANED: u8 = 0x01;
 
 /// SYSX frame for a response: same header shape as requests, **2-byte** body (`§2.1` / `§2.1.1`).
 #[must_use]

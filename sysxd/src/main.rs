@@ -7,6 +7,8 @@
 //! 4. Pre-reactor DAG Kahn sort + cycle/depth validation (max 16)
 //! 5. Main reactor (epoll_wait on control socket + cgroup.events)
 
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use log::{error, info};
@@ -41,15 +43,23 @@ fn run() -> Result<(), SysXError> {
     let boot = sysxd::boot::initialize(&start)?;
 
     // Phase 2: Pre-reactor DAG validation (Kahn topological sort, cycle detection, max depth 16)
-    let schemas = sysxd::schema_load::load_schemas()?;
+    let schemas_vec = sysxd::schema_load::load_schemas()?;
     info!(
         "SYSX_ORACLE_SCHEMAS_LOADED count={}",
-        schemas.len()
+        schemas_vec.len()
     );
-    sysxd::dag::validate(&schemas)?;
+    sysxd::dag::validate(&schemas_vec)?;
+
+    let schemas: Arc<HashMap<String, sysx_schema::ServiceSchema>> = Arc::new(
+        schemas_vec
+            .into_iter()
+            .map(|s| (s.service.name.clone(), s))
+            .collect(),
+    );
+    let tombstoned: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // Phase 3: Main reactor (`12` §2.2: epoll timeout and cgroup cap from sealed core.bin)
-    sysxd::reactor::run(boot.listener, &boot.core, &rt)?;
+    sysxd::reactor::run(boot.listener, &boot.core, &rt, tombstoned, schemas)?;
 
     info!("sysxd shutdown complete");
     Ok(())

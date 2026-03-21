@@ -259,6 +259,7 @@ def phase_initramfs_layout(sysx_root: Path, build_dir: Path) -> bool:
         (rootfs / "init").chmod(0o755)
         print("[SUCCESS] Placed sysxd as /init")
         copy_gnu_dynamic_deps(binary_src, rootfs)
+        _copy_busybox_sh(rootfs)
     else:
         print("[WARN] No binary, creating stub")
         (rootfs / "sbin" / "init").write_text("#!/bin/sh\necho 'SYSX STUB INIT'\nexec /bin/sh\n")
@@ -298,6 +299,7 @@ def phase_qemu_headless(
     run_vm: bool,
     qemu_timeout_sec: int,
     oracle_strict: bool = False,
+    dual_oracle_strict: bool = False,
 ) -> bool:
     """Phase 3: Pack initramfs; optionally run QEMU with kernel bzImage."""
     print("\n=== PHASE 3: INITRAMFS PACK + QEMU ===")
@@ -359,24 +361,95 @@ def phase_qemu_headless(
     except subprocess.TimeoutExpired as ex:
         print("[INFO] QEMU hit timeout (expected if sysxd hangs in reactor loop)")
         serial = (ex.stdout or "") + (ex.stderr or "")
-        ok = verify_serial_oracle(serial, strict=oracle_strict)
-        if oracle_strict and not ok:
+        ok_s = verify_serial_oracle(serial, strict=oracle_strict)
+        ok_d = verify_dual_oracle(serial, strict=dual_oracle_strict)
+        if oracle_strict and not ok_s:
+            return False
+        if dual_oracle_strict and not ok_d:
             return False
         return True
     serial = (r.stdout or "") + (r.stderr or "")
-    ok = verify_serial_oracle(serial, strict=oracle_strict)
-    if oracle_strict and not ok:
+    ok_s = verify_serial_oracle(serial, strict=oracle_strict)
+    ok_d = verify_dual_oracle(serial, strict=dual_oracle_strict)
+    if oracle_strict and not ok_s:
+        return False
+    if dual_oracle_strict and not ok_d:
         return False
     print(f"[INFO] QEMU exited with code {r.returncode}")
     return True
 
 
-# `11` — Phase 1: serial markers; dual IPC vs sysfs is a later phase.
+# `11` — serial markers + dual-oracle lines (`SYSX_ORACLE_DUAL`).
 _ORACLE_MARKERS_REQUIRED = (
     "SYSX_ORACLE_SCHEMAS_LOADED",
     "SYSX_ORACLE_DAG_OK",
     "SYSX_ORACLE_REACTOR_READY",
 )
+
+# `11` § Test 0 / dual-oracle — lines emitted by sysxd `reactor.rs` after IPC dispatch.
+_ORACLE_DUAL_RE = re.compile(
+    r"SYSX_ORACLE_DUAL op=(?P<op>\w+) service=(?P<svc>\S+) "
+    r"ipc=S:0x(?P<s>[0-9a-fA-F]{2}):R:0x(?P<r>[0-9a-fA-F]{2}) "
+    r"sysfs_populated=(?P<pop>[\w]+) sysfs_match=(?P<m>\d+|na)"
+)
+
+
+def _copy_busybox_sh(rootfs: Path) -> None:
+    """Provide /bin/sh in initramfs when host has busybox (QEMU baseline workload)."""
+    for cand in (shutil.which("busybox"), Path("/usr/bin/busybox")):
+        if cand and Path(cand).is_file():
+            dest_dir = rootfs / "bin"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            bb = dest_dir / "busybox"
+            shutil.copy2(Path(cand), bb)
+            bb.chmod(0o755)
+            sh_link = dest_dir / "sh"
+            if sh_link.exists() or sh_link.is_symlink():
+                sh_link.unlink()
+            sh_link.symlink_to("busybox")
+            print(f"[SUCCESS] Installed busybox -> {bb} (symlink /bin/sh)")
+            return
+    print(
+        "[WARN] busybox not found; baseline schema exec /bin/sh may fail in initramfs. "
+        "Install busybox or add a static shell under /bin/sh."
+    )
+
+
+def verify_dual_oracle(serial_text: str, strict: bool = False) -> bool:
+    """`11` — compare IPC reply bytes vs sysfs `populated` hint on SYSX_ORACLE_DUAL lines."""
+    lines = [ln for ln in serial_text.splitlines() if "SYSX_ORACLE_DUAL" in ln]
+    if not lines:
+        msg = "[ORACLE] No SYSX_ORACLE_DUAL lines (11 dual-oracle)"
+        if strict:
+            print(msg, file=sys.stderr)
+            return False
+        print(f"{msg} (non-strict: continue)")
+        return True
+
+    bad: list[str] = []
+    for ln in lines:
+        m = _ORACLE_DUAL_RE.search(ln)
+        if not m:
+            bad.append(f"unparseable: {ln[:120]}")
+            continue
+        op = m.group("op")
+        b0 = int(m.group("s"), 16)
+        b1 = int(m.group("r"), 16)
+        pop = m.group("pop")
+        mat = m.group("m")
+        if op == "status" and mat != "na":
+            if mat != "1":
+                bad.append(f"status sysfs_match={mat} (expected 1) ipc=[0x{b0:02x},0x{b1:02x}] pop={pop}")
+        # start/stop: sysfs_match=na — informational only
+    if bad:
+        msg = "[ORACLE] Dual-oracle issues: " + "; ".join(bad)
+        if strict:
+            print(msg, file=sys.stderr)
+            return False
+        print(f"[ORACLE] {msg} (non-strict: continue)")
+        return True
+    print("[ORACLE] SYSX_ORACLE_DUAL lines OK (status rows sysfs_match=1 where present)")
+    return True
 
 
 def verify_serial_oracle(serial_text: str, strict: bool = False) -> bool:
@@ -427,6 +500,11 @@ def main():
         action="store_true",
         help="Fail if QEMU serial is missing SYSX_ORACLE_* markers (11)",
     )
+    parser.add_argument(
+        "--dual-oracle-strict",
+        action="store_true",
+        help="Fail if SYSX_ORACLE_DUAL lines missing or status sysfs_match!=1 (11 Test 0)",
+    )
     args = parser.parse_args()
 
     args.build_dir.mkdir(parents=True, exist_ok=True)
@@ -448,6 +526,7 @@ def main():
             args.qemu_run,
             args.qemu_timeout,
             oracle_strict=args.oracle_strict,
+            dual_oracle_strict=args.dual_oracle_strict,
         )
 
     if success:

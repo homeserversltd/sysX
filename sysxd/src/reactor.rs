@@ -5,10 +5,11 @@
 //! `12` §2.2: `epoll_wait` timeout from `core.bin`; partial frame assembly bounded from first byte;
 //! `MAX_CONCURRENT_FDS` caps accepted control connections (`14` §5).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixListener;
+use std::sync::{Arc, Mutex};
 
 use std::str;
 use std::time::{Duration, Instant};
@@ -20,14 +21,16 @@ use sysx_ipc::{
     FrameError, Header, SysxCoreBin, MAX_CONCURRENT_FDS, MAX_PAYLOAD_BYTES,
     OUTCOME_EPISTEMIC_CONFLICT, OUTCOME_SUCCESS, OUTCOME_TOMBSTONED, OUTCOME_UNAUTHORIZED,
     OUTCOME_WIRE_PARSE, REASON_CGROUP_CAPACITY, REASON_NA, STATUS_OFFLINE, STATUS_REASON_NONE,
-    STATUS_RUNNING, STATUS_SWEEPING,
+    STATUS_RUNNING, STATUS_SWEEPING, STATUS_TOMBSTONED_PRIMARY,
 };
+use sysx_schema::ServiceSchema;
 use sysx_runtime::{
     read_sysfs_cgroup_populated, validate_ipc_service_name, RuntimeContext,
 };
 
 use crate::cgroup_ops::{ensure_start_cgroup, StartCgroupError};
-use crate::stop_ladder::{stop_service, StopOutcome};
+use crate::service_spawn::spawn_simple_service;
+use crate::stop_ladder::{dfs_post_order_rmdir, stop_service, StopOutcome};
 use crate::terminal_broadcast::{
     run_terminal_broadcast, TerminalBroadcastKind,
 };
@@ -55,6 +58,8 @@ pub fn run(
     listener: UnixListener,
     sealed: &SysxCoreBin,
     rt: &RuntimeContext,
+    tombstoned: Arc<Mutex<HashSet<String>>>,
+    schemas: Arc<HashMap<String, ServiceSchema>>,
 ) -> Result<(), SysXError> {
     listener
         .set_nonblocking(true)
@@ -159,6 +164,8 @@ pub fn run(
                             &asm_budget,
                             sealed,
                             rt,
+                            &tombstoned,
+                            &schemas,
                         )?;
                     }
                 }
@@ -357,6 +364,8 @@ fn on_client_readable(
     asm_budget: &Duration,
     sealed: &SysxCoreBin,
     rt: &RuntimeContext,
+    tombstoned: &Arc<Mutex<HashSet<String>>>,
+    schemas: &Arc<HashMap<String, ServiceSchema>>,
 ) -> Result<(), SysXError> {
     if clients.get(&fd).is_none() {
         warn!("epoll event for unknown fd {}", fd);
@@ -435,7 +444,15 @@ fn on_client_readable(
             let pl_owned = pl.to_vec();
             info!("Decoded IPC command {:?}", hdr.command);
             if let Some(mut c) = remove_client(epoll, clients, fd)? {
-                dispatch_ipc(&mut c.stream, &hdr, &pl_owned, sealed, rt);
+                dispatch_ipc(
+                    &mut c.stream,
+                    &hdr,
+                    &pl_owned,
+                    sealed,
+                    rt,
+                    tombstoned,
+                    schemas,
+                );
             }
             maybe_resume_listener(epoll, listener, listen_fd, listener_in_epoll, clients.len())?;
         }
@@ -481,12 +498,82 @@ fn status_from_kernel(rt: &RuntimeContext, name: &str) -> (u8, u8) {
     }
 }
 
+fn is_tombstoned(tombstoned: &Arc<Mutex<HashSet<String>>>, name: &str) -> bool {
+    tombstoned
+        .lock()
+        .map(|g| g.contains(name))
+        .unwrap_or(false)
+}
+
+/// `Command::Status` — kernel sysfs plus in-reactor **`Tombstoned`** set (`16` §4).
+fn status_reply(
+    rt: &RuntimeContext,
+    name: &str,
+    tombstoned: &Arc<Mutex<HashSet<String>>>,
+) -> (u8, u8) {
+    if is_tombstoned(tombstoned, name) {
+        return (STATUS_TOMBSTONED_PRIMARY, STATUS_REASON_NONE);
+    }
+    status_from_kernel(rt, name)
+}
+
+fn sysfs_populated_label(rt: &RuntimeContext, name: &str) -> &'static str {
+    let events_path = match rt.cgroup_events_path(name) {
+        Ok(p) => p,
+        Err(_) => return "na",
+    };
+    match read_sysfs_cgroup_populated(&events_path) {
+        Ok(Some(true)) => "1",
+        Ok(Some(false)) => "0",
+        Ok(None) => "none",
+        Err(_) => "err",
+    }
+}
+
+fn status_sysfs_matches_ipc(
+    rt: &RuntimeContext,
+    name: &str,
+    ipc_b0: u8,
+    ipc_b1: u8,
+    tombstoned: &Arc<Mutex<HashSet<String>>>,
+) -> u8 {
+    let k = status_reply(rt, name, tombstoned);
+    u8::from(k.0 == ipc_b0 && k.1 == ipc_b1)
+}
+
+/// `11` dual-oracle: serial line for harness / `install.py` (IPC bytes vs sysfs `populated`).
+fn log_oracle_dual(
+    op: &'static str,
+    name: &str,
+    hdr_cmd: Command,
+    ipc_b0: u8,
+    ipc_b1: u8,
+    rt: &RuntimeContext,
+    tombstoned: &Arc<Mutex<HashSet<String>>>,
+) {
+    let sysfs_pop = sysfs_populated_label(rt, name);
+    if hdr_cmd == Command::Status {
+        let m = status_sysfs_matches_ipc(rt, name, ipc_b0, ipc_b1, tombstoned);
+        info!(
+            "SYSX_ORACLE_DUAL op={} service={} ipc=S:0x{:02x}:R:0x{:02x} sysfs_populated={} sysfs_match={} (11)",
+            op, name, ipc_b0, ipc_b1, sysfs_pop, m
+        );
+    } else {
+        info!(
+            "SYSX_ORACLE_DUAL op={} service={} ipc=S:0x{:02x}:R:0x{:02x} sysfs_populated={} sysfs_match=na (11)",
+            op, name, ipc_b0, ipc_b1, sysfs_pop
+        );
+    }
+}
+
 fn dispatch_ipc(
     sock: &mut impl Write,
     hdr: &Header,
     payload: &[u8],
     sealed: &SysxCoreBin,
     rt: &RuntimeContext,
+    tombstoned: &Arc<Mutex<HashSet<String>>>,
+    schemas: &Arc<HashMap<String, ServiceSchema>>,
 ) {
     let plen = payload.len();
     match hdr.command {
@@ -531,9 +618,69 @@ fn dispatch_ipc(
                 reply_pre_dispatch_error(sock, OUTCOME_WIRE_PARSE, REASON_NA);
                 return;
             }
-            let out = encode_ipc_reply(hdr.command, OUTCOME_SUCCESS, REASON_NA);
-            if let Err(e) = sock.write_all(&out) {
-                error!("reply write failed: {}", e);
+            if !is_tombstoned(tombstoned, name) {
+                info!(
+                    "Reset {:?}: not Tombstoned — epistemic conflict (16 §4)",
+                    name
+                );
+                let out = encode_ipc_reply(hdr.command, OUTCOME_EPISTEMIC_CONFLICT, REASON_NA);
+                if let Err(e) = sock.write_all(&out) {
+                    error!("reply write failed: {}", e);
+                }
+                log_oracle_dual(
+                    "reset",
+                    name,
+                    Command::Reset,
+                    OUTCOME_EPISTEMIC_CONFLICT,
+                    REASON_NA,
+                    rt,
+                    tombstoned,
+                );
+                return;
+            }
+            let cgroup_path = match rt.service_cgroup_path(name) {
+                Ok(p) => p,
+                Err(_) => {
+                    reply_pre_dispatch_error(sock, OUTCOME_WIRE_PARSE, REASON_NA);
+                    return;
+                }
+            };
+            match dfs_post_order_rmdir(&cgroup_path) {
+                Ok(()) => {
+                    if let Ok(mut g) = tombstoned.lock() {
+                        g.remove(name);
+                    }
+                    info!("Reset {:?}: DFS cleared — Tombstoned cleared (16 §4)", name);
+                    let out = encode_ipc_reply(hdr.command, OUTCOME_SUCCESS, REASON_NA);
+                    if let Err(e) = sock.write_all(&out) {
+                        error!("reply write failed: {}", e);
+                    }
+                    log_oracle_dual(
+                        "reset",
+                        name,
+                        Command::Reset,
+                        OUTCOME_SUCCESS,
+                        REASON_NA,
+                        rt,
+                        tombstoned,
+                    );
+                }
+                Err(e) => {
+                    error!("Reset {:?}: DFS unlink failed: {} (EBUSY path 16 §4)", name, e);
+                    let out = encode_ipc_reply(hdr.command, OUTCOME_EPISTEMIC_CONFLICT, REASON_NA);
+                    if let Err(e) = sock.write_all(&out) {
+                        error!("reply write failed: {}", e);
+                    }
+                    log_oracle_dual(
+                        "reset",
+                        name,
+                        Command::Reset,
+                        OUTCOME_EPISTEMIC_CONFLICT,
+                        REASON_NA,
+                        rt,
+                        tombstoned,
+                    );
+                }
             }
         }
         Command::Start => {
@@ -552,8 +699,37 @@ fn dispatch_ipc(
                 reply_pre_dispatch_error(sock, OUTCOME_WIRE_PARSE, REASON_NA);
                 return;
             }
+            if is_tombstoned(tombstoned, name) {
+                info!("Start {:?}: Tombstoned — deny (16 §4)", name);
+                let out = encode_ipc_reply(Command::Start, OUTCOME_TOMBSTONED, REASON_NA);
+                if let Err(e) = sock.write_all(&out) {
+                    error!("reply write failed: {}", e);
+                }
+                log_oracle_dual(
+                    "start",
+                    name,
+                    Command::Start,
+                    OUTCOME_TOMBSTONED,
+                    REASON_NA,
+                    rt,
+                    tombstoned,
+                );
+                return;
+            }
             let (b0, b1) = match ensure_start_cgroup(rt, name, sealed.max_cgroups) {
-                Ok(()) => (OUTCOME_SUCCESS, REASON_NA),
+                Ok(()) => {
+                    if let Some(schema) = schemas.get(name) {
+                        match spawn_simple_service(rt, schema) {
+                            Ok(()) => (OUTCOME_SUCCESS, REASON_NA),
+                            Err(e) => {
+                                error!("Start {:?}: spawn failed: {}", name, e);
+                                (OUTCOME_EPISTEMIC_CONFLICT, REASON_NA)
+                            }
+                        }
+                    } else {
+                        (OUTCOME_SUCCESS, REASON_NA)
+                    }
+                }
                 Err(StartCgroupError::AtCapacity { used, max }) => {
                     info!(
                         "Start {:?}: reply [S:{:#04x}, R:{:#04x}] capacity used={} max={} (12 §2.2)",
@@ -565,7 +741,8 @@ fn dispatch_ipc(
                     );
                     (OUTCOME_EPISTEMIC_CONFLICT, REASON_CGROUP_CAPACITY)
                 }
-                Err(StartCgroupError::Mkdir(_)) => {
+                Err(StartCgroupError::Mkdir(e)) => {
+                    error!("Start {:?}: mkdir: {}", name, e);
                     (OUTCOME_EPISTEMIC_CONFLICT, REASON_NA)
                 }
             };
@@ -573,6 +750,7 @@ fn dispatch_ipc(
             if let Err(e) = sock.write_all(&out) {
                 error!("reply write failed: {}", e);
             }
+            log_oracle_dual("start", name, Command::Start, b0, b1, rt, tombstoned);
         }
         Command::Stop => {
             if hdr.payload_length == 0 || plen == 0 {
@@ -590,9 +768,29 @@ fn dispatch_ipc(
                 reply_pre_dispatch_error(sock, OUTCOME_WIRE_PARSE, REASON_NA);
                 return;
             }
+            if is_tombstoned(tombstoned, name) {
+                info!("Stop {:?}: already Tombstoned (16 §4)", name);
+                let out = encode_ipc_reply(Command::Stop, OUTCOME_TOMBSTONED, REASON_NA);
+                if let Err(e) = sock.write_all(&out) {
+                    error!("reply write failed: {}", e);
+                }
+                log_oracle_dual(
+                    "stop",
+                    name,
+                    Command::Stop,
+                    OUTCOME_TOMBSTONED,
+                    REASON_NA,
+                    rt,
+                    tombstoned,
+                );
+                return;
+            }
             let (b0, b1) = match stop_service(rt, name) {
                 Ok(StopOutcome::AlreadyGone) => {
                     info!("Stop {:?}: AlreadyGone (12 §4)", name);
+                    if let Ok(mut g) = tombstoned.lock() {
+                        g.remove(name);
+                    }
                     (OUTCOME_SUCCESS, REASON_NA)
                 }
                 Ok(StopOutcome::Dead) => {
@@ -600,6 +798,9 @@ fn dispatch_ipc(
                         "Stop {:?}: Dead after ladder + DFS unlink (12 §4.1 / §4.1.1)",
                         name
                     );
+                    if let Ok(mut g) = tombstoned.lock() {
+                        g.remove(name);
+                    }
                     (OUTCOME_SUCCESS, REASON_NA)
                 }
                 Ok(StopOutcome::Tombstoned) => {
@@ -607,6 +808,9 @@ fn dispatch_ipc(
                         "Stop {:?}: Tombstoned [S:{:#04x}, R:{:#04x}] (12 §4.1)",
                         name, OUTCOME_TOMBSTONED, REASON_NA
                     );
+                    if let Ok(mut g) = tombstoned.lock() {
+                        g.insert(name.to_string());
+                    }
                     (OUTCOME_TOMBSTONED, REASON_NA)
                 }
                 Err(e) => {
@@ -618,6 +822,7 @@ fn dispatch_ipc(
             if let Err(e) = sock.write_all(&out) {
                 error!("reply write failed: {}", e);
             }
+            log_oracle_dual("stop", name, Command::Stop, b0, b1, rt, tombstoned);
         }
         Command::Status => {
             if hdr.payload_length == 0 || plen == 0 {
@@ -635,15 +840,16 @@ fn dispatch_ipc(
                 reply_pre_dispatch_error(sock, OUTCOME_WIRE_PARSE, REASON_NA);
                 return;
             }
-            let (b0, b1) = status_from_kernel(rt, name);
+            let (b0, b1) = status_reply(rt, name, tombstoned);
             info!(
-                "Status {:?} -> [S:{:#04x}, R:{:#04x}] (kernel sysfs)",
+                "Status {:?} -> [S:{:#04x}, R:{:#04x}] (tombstone+kernel sysfs)",
                 name, b0, b1
             );
             let out = encode_ipc_reply(Command::Status, b0, b1);
             if let Err(e) = sock.write_all(&out) {
                 error!("reply write failed: {}", e);
             }
+            log_oracle_dual("status", name, Command::Status, b0, b1, rt, tombstoned);
         }
     }
 }
