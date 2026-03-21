@@ -94,6 +94,9 @@ pub struct Namespaces {
     pub mount: bool,
     pub network: bool,
     pub pid: bool,
+    /// Hostname/UTS isolation (`CLONE_NEWUTS`).
+    #[serde(default)]
+    pub uts: bool,
     pub user: bool,
 }
 

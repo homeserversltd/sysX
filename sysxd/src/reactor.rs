@@ -30,7 +30,9 @@ use sysx_runtime::{
 
 use crate::cgroup_ops::{ensure_start_cgroup, StartCgroupError};
 use crate::service_spawn::{spawn_simple_service, SpawnOutcome};
-use crate::stop_ladder::{dfs_post_order_rmdir, stop_service, StopOutcome};
+use crate::stop_ladder::{
+    dfs_post_order_rmdir, is_rmdir_ebusy, stop_service, StopOutcome,
+};
 use crate::terminal_broadcast::{
     run_terminal_broadcast, TerminalBroadcastKind,
 };
@@ -590,6 +592,15 @@ fn apply_reaper_dfs(
                 t.remove(name);
             }
             info!("reaper DFS unlink OK service={} (12 §4.1.1)", name);
+        }
+        Err(e) if is_rmdir_ebusy(&e) => {
+            error!(
+                "reaper DFS EBUSY service={} — Tombstoned (topological lock; slot consumed until Reset) (12 §4.1.1)",
+                name
+            );
+            if let Ok(mut t) = tombstoned.lock() {
+                t.insert(name.to_string());
+            }
         }
         Err(e) => error!("reaper DFS failed service={}: {}", name, e),
     }

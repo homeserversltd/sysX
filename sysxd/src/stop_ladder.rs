@@ -232,6 +232,11 @@ fn wait_populated_zero_sleep(
     }
 }
 
+/// True when **`rmdir(2)`** failed with **`EBUSY`** (directory pinned; reaper DFS cannot finish).
+pub fn is_rmdir_ebusy(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EBUSY)
+}
+
 /// Directories only — post-order: children first, then `rmdir` (`12` §4.1.1).
 /// Used by **`Command::Reset`** on **`Tombstoned`** recovery (`16` §4).
 pub(crate) fn dfs_post_order_rmdir(path: &Path) -> io::Result<()> {
