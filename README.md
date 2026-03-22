@@ -25,7 +25,16 @@ From the repository root:
 
 ```bash
 cargo build
+cargo test
 ```
+
+## Testing status and adoption frontier
+
+**Automated testing (repo gate):** The phased implementation (supervisor, schemas, DAG orchestration, stop ladder, terminal broadcast, recovery/circuit behavior, reaper path, and the `tools/install.py` initramfs pack plus optional QEMU checks) is exercised with **`cargo test`** at the workspace root and with the install tool where a kernel is available. Treat that as **“software proof in-tree,”** not a warranty on every workload or host.
+
+**Next step for anyone picking this up: bare metal (or a serious VM):** Running `sysxd` as PID 1 on real hardware means supplying a kernel, an initramfs that matches what `install.py` forges (`/init`, `/etc/sysx/core.bin`, `/etc/sysx/schemas/`, cgroup v2), and bootloader configuration. That path is **intentionally** the next frontier: automated runs cannot substitute for firmware, drivers, and consoles on physical boxes.
+
+**What is still “your problem” outside the automated harness:** The supervisor owns **declared services and cgroup truth** per schema. It does **not** replace a full general-purpose init ecosystem on its own. Expect to own or integrate **network bring-up** (interfaces, routing, DNS client policy), **getty / login** if you want a console, **disk and fstab** if you pivot root or mount more than the initramfs, **clock and time**, and **recovery** (second boot entry, serial console, or initramfs shell) if PID 1 misbehaves. Those concerns are normal for any replacement init; they are called out here so adopters do not assume QEMU parity on first metal boot.
 
 ## Quick usage
 
