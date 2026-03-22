@@ -206,6 +206,8 @@ pub const STATUS_OFFLINE: u8 = 0x00;
 pub const STATUS_RUNNING: u8 = 0x02;
 /// §2.1.1 — cgroup exists, `populated=0`, directory not yet DFS-unlinked (`12` §3).
 pub const STATUS_SWEEPING: u8 = 0x03;
+/// §2.1.1 — **Recovering** — circuit backoff timer armed, pending re-`Start` (`Phase 4`).
+pub const STATUS_RECOVERING: u8 = 0x07;
 /// §2.1.1 — **`Dead`** — `populated=0` **and** §4.1.1 DFS post-order unlink complete; sysfs path absent (`12` §3).
 pub const STATUS_DEAD_PRIMARY: u8 = 0x04;
 /// §2.1.1 — **`Failed`** primary state (`12` §2.1.1); byte1 = `FailureReason` (e.g. **`0x01`** Orphaned).
@@ -215,6 +217,8 @@ pub const STATUS_TOMBSTONED_PRIMARY: u8 = 0x06;
 pub const STATUS_REASON_NONE: u8 = 0x00;
 /// §2.1.1 — **`Failed`** + **`Orphaned`** (`11` dual-oracle / `12` §2.1.1 reason column).
 pub const STATUS_REASON_ORPHANED: u8 = 0x01;
+/// §2.1.1 — **`Failed`** + **`CircuitOpen`** (max restarts within window; `Phase 4`).
+pub const STATUS_REASON_CIRCUIT_OPEN: u8 = 0x05;
 
 /// SYSX frame for a response: same header shape as requests, **2-byte** body (`§2.1` / `§2.1.1`).
 #[must_use]

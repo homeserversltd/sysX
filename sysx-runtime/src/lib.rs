@@ -59,6 +59,11 @@ impl RuntimeContext {
     pub fn cgroup_events_path(&self, service_id: &str) -> Result<PathBuf, RuntimeError> {
         Ok(self.service_cgroup_path(service_id)?.join("cgroup.events"))
     }
+
+    /// `memory.events` path (cgroup v2) for OOM oracle probes (`Phase 4`).
+    pub fn memory_events_path(&self, service_id: &str) -> Result<PathBuf, RuntimeError> {
+        Ok(self.service_cgroup_path(service_id)?.join("memory.events"))
+    }
 }
 
 #[derive(Error, Debug)]
@@ -98,6 +103,29 @@ pub fn read_sysfs_cgroup_populated(events_path: &Path) -> io::Result<Option<bool
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Read `memory.events` and return whether **`oom_kill`** counter is non-zero (best-effort).
+pub fn read_sysfs_memory_oom_kill_nonzero(path: &Path) -> io::Result<bool> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(parse_memory_events_oom_kill(&s).unwrap_or(false)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Parse cgroup v2 `memory.events` for **`oom_kill`** field.
+pub fn parse_memory_events_oom_kill(content: &str) -> Option<bool> {
+    for line in content.lines() {
+        let mut it = line.split_whitespace();
+        if it.next() == Some("oom_kill") {
+            return match it.next() {
+                Some(n) => n.parse::<u64>().ok().map(|v| v > 0),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 /// Parse `cgroup.events` body for the `populated` field (kernel text format).
@@ -154,5 +182,12 @@ mod tests {
         assert_eq!(parse_cgroup_events_populated(s), Some(true));
         let s2 = "frozen 0\npopulated 0\n";
         assert_eq!(parse_cgroup_events_populated(s2), Some(false));
+    }
+
+    #[test]
+    fn parse_memory_events_oom_kill_shape() {
+        let s = "low 0\nhigh 0\nmax 0\noom 1\noom_kill 1\n";
+        assert_eq!(parse_memory_events_oom_kill(s), Some(true));
+        assert_eq!(parse_memory_events_oom_kill("oom_kill 0\n"), Some(false));
     }
 }

@@ -8,6 +8,7 @@ pub mod boot;
 pub mod cgroup_ops;
 pub mod dag;
 pub mod orchestration;
+pub mod recovery;
 pub mod reactor;
 pub mod schema_load;
 pub mod service_spawn;

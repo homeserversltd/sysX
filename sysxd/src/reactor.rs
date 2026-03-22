@@ -21,17 +21,22 @@ use sysx_ipc::{
     FrameError, Header, SysxCoreBin, MAX_CONCURRENT_FDS, MAX_PAYLOAD_BYTES,
     OUTCOME_EPISTEMIC_CONFLICT, OUTCOME_SUCCESS, OUTCOME_TOMBSTONED, OUTCOME_UNAUTHORIZED,
     OUTCOME_WIRE_PARSE, REASON_CGROUP_CAPACITY, REASON_NA, STATUS_DEAD_PRIMARY, STATUS_FAILED_PRIMARY,
-    STATUS_OFFLINE, STATUS_REASON_NONE, STATUS_REASON_ORPHANED, STATUS_RUNNING, STATUS_SWEEPING,
-    STATUS_TOMBSTONED_PRIMARY,
+    STATUS_OFFLINE, STATUS_REASON_CIRCUIT_OPEN, STATUS_REASON_NONE, STATUS_REASON_ORPHANED,
+    STATUS_RECOVERING, STATUS_RUNNING, STATUS_SWEEPING, STATUS_TOMBSTONED_PRIMARY,
 };
 use sysx_schema::ServiceSchema;
 use sysx_runtime::{
-    read_sysfs_cgroup_populated, validate_ipc_service_name, RuntimeContext,
+    read_sysfs_cgroup_populated, read_sysfs_memory_oom_kill_nonzero, validate_ipc_service_name,
+    RuntimeContext,
 };
 
 use crate::cgroup_ops::{ensure_start_cgroup, StartCgroupError};
 use crate::dag::DagRuntime;
 use crate::orchestration::{record_service_failed, propagate_cascade_failure, OrchestratorState};
+use crate::recovery::{
+    backoff_exponential_ms, circuit_should_open, prune_restart_window, recovery_applies,
+    recovery_timerfd_arm_ms,
+};
 use crate::service_spawn::{spawn_simple_service, SpawnOutcome};
 use crate::stop_ladder::{
     dfs_post_order_rmdir, is_rmdir_ebusy, stop_service, StopOutcome,
@@ -50,6 +55,70 @@ const MAX_FRAME_BYTES: usize = Header::SIZE + MAX_PAYLOAD_BYTES;
 fn reply_pre_dispatch_error(sock: &mut impl Write, b0: u8, b1: u8) {
     let out = encode_ipc_reply(Command::Start, b0, b1);
     let _ = sock.write_all(&out);
+}
+
+fn recovery_timer_lookup(
+    pending: &Arc<Mutex<HashMap<String, std::fs::File>>>,
+    fd: RawFd,
+) -> Option<String> {
+    let m = pending.lock().ok()?;
+    m.iter()
+        .find(|(_, f)| f.as_raw_fd() == fd)
+        .map(|(s, _)| s.clone())
+}
+
+fn handle_recovery_timer_fd(
+    fd: RawFd,
+    recovery_pending: &Arc<Mutex<HashMap<String, std::fs::File>>>,
+    epoll: &Epoll,
+    rt: &RuntimeContext,
+    sealed: &SysxCoreBin,
+    tombstoned: &Arc<Mutex<HashSet<String>>>,
+    dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
+    schemas: &Arc<HashMap<String, ServiceSchema>>,
+    orch: &Arc<Mutex<OrchestratorState>>,
+    readiness_files: &Arc<Mutex<HashMap<RawFd, (String, std::fs::File)>>>,
+) -> Result<(), SysXError> {
+    use std::os::unix::io::AsFd;
+    use std::io::Read;
+    let name = recovery_timer_lookup(recovery_pending, fd).ok_or_else(|| {
+        SysXError::Reactor("recovery timer fd not in pending map".into())
+    })?;
+    let file = {
+        let mut m = recovery_pending.lock().map_err(|e| {
+            SysXError::Reactor(format!("recovery pending lock: {}", e))
+        })?;
+        m.remove(&name)
+    };
+    let Some(mut f) = file else {
+        return Ok(());
+    };
+    let mut drain = [0u8; 8];
+    let _ = f.read(&mut drain);
+    epoll.delete(f.as_fd()).map_err(|e| {
+        SysXError::Reactor(format!("epoll delete recovery timer: {}", e))
+    })?;
+    drop(f);
+    if let Ok(mut g) = orch.lock() {
+        g.recovering.remove(&name);
+    }
+    info!(
+        "[SYSX] RECOVERY_TIMER_FIRE service={} — respawn (Phase 4)",
+        name
+    );
+    spawn_service_for_orchestration(
+        &name,
+        rt,
+        sealed,
+        tombstoned,
+        dfs_proven_dead,
+        schemas,
+        epoll,
+        readiness_files,
+        orch,
+    )
+    .map_err(SysXError::Reactor)?;
+    Ok(())
 }
 
 struct PendingConn {
@@ -134,6 +203,8 @@ pub fn run(
 
     let readiness_files: Arc<Mutex<HashMap<RawFd, (String, std::fs::File)>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let recovery_pending: Arc<Mutex<HashMap<String, std::fs::File>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     #[cfg(target_os = "linux")]
     {
@@ -217,7 +288,7 @@ pub fn run(
                     } else if signalfd_raw == Some(fd) {
                         #[cfg(target_os = "linux")]
                         if let Some(ref sfd) = sigpwr {
-                            on_sigpwr_signalfd(sfd, rt);
+                            on_sigpwr_signalfd(sfd, rt, &orch);
                         }
                     } else if fd == wake_fd {
                         drain_reaper_wake_pipe(
@@ -225,6 +296,19 @@ pub fn run(
                             rt,
                             &dfs_proven_dead,
                             &tombstoned,
+                        )?;
+                    } else if recovery_timer_lookup(&recovery_pending, fd).is_some() {
+                        handle_recovery_timer_fd(
+                            fd,
+                            &recovery_pending,
+                            &epoll,
+                            rt,
+                            sealed,
+                            &tombstoned,
+                            &dfs_proven_dead,
+                            &schemas,
+                            &orch,
+                            &readiness_files,
                         )?;
                     } else if readiness_files
                         .lock()
@@ -243,6 +327,7 @@ pub fn run(
                             &dag,
                             &orch,
                             &autotest_stop_after_readiness,
+                            &recovery_pending,
                         )?;
                     } else {
                         on_client_readable(
@@ -646,12 +731,16 @@ fn evaluate_status_abi(
     dfs_proven_dead: &Arc<Mutex<HashSet<String>>>,
     orch: &Arc<Mutex<OrchestratorState>>,
 ) -> (u8, u8) {
-    if orch
-        .lock()
-        .map(|g| g.cascade_failed.contains(name))
-        .unwrap_or(false)
-    {
-        return (STATUS_FAILED_PRIMARY, STATUS_REASON_ORPHANED);
+    if let Ok(g) = orch.lock() {
+        if g.cascade_failed.contains(name) {
+            if g.circuit_origin.contains(name) {
+                return (STATUS_FAILED_PRIMARY, STATUS_REASON_CIRCUIT_OPEN);
+            }
+            return (STATUS_FAILED_PRIMARY, STATUS_REASON_ORPHANED);
+        }
+        if g.recovering.contains(name) {
+            return (STATUS_RECOVERING, STATUS_REASON_NONE);
+        }
     }
     let cgroup_dir = match rt.service_cgroup_path(name) {
         Ok(p) => p,
@@ -813,7 +902,7 @@ fn dispatch_ipc(
                 error!("reply write failed: {}", e);
                 return;
             }
-            run_terminal_broadcast(rt, kind, ipc_tag);
+            run_terminal_broadcast(rt, kind, ipc_tag, orch);
         }
         Command::Reset => {
             if hdr.payload_length == 0 || plen == 0 {
@@ -942,6 +1031,29 @@ fn dispatch_ipc(
             }
             if orch
                 .lock()
+                .map(|g| g.recovering.contains(name))
+                .unwrap_or(false)
+            {
+                info!("Start {:?}: recovering — deny (Phase 4)", name);
+                let out = encode_ipc_reply(Command::Start, OUTCOME_EPISTEMIC_CONFLICT, REASON_NA);
+                if let Err(e) = sock.write_all(&out) {
+                    error!("reply write failed: {}", e);
+                }
+                log_oracle_dual(
+                    "start",
+                    name,
+                    Command::Start,
+                    OUTCOME_EPISTEMIC_CONFLICT,
+                    REASON_NA,
+                    rt,
+                    tombstoned,
+                    dfs_proven_dead,
+                    orch,
+                );
+                return;
+            }
+            if orch
+                .lock()
                 .map(|g| g.cascade_failed.contains(name))
                 .unwrap_or(false)
             {
@@ -990,7 +1102,10 @@ fn dispatch_ipc(
                                 if let Ok(mut g) = dfs_proven_dead.lock() {
                                     g.remove(name);
                                 }
-                                let SpawnOutcome { readiness_read } = outcome;
+                                let SpawnOutcome {
+                                    readiness_read,
+                                    root_pid,
+                                } = outcome;
                                 let rfd = readiness_read.as_raw_fd();
                                 let ev = EpollEvent::new(
                                     EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP,
@@ -1006,6 +1121,7 @@ fn dispatch_ipc(
                                 }
                                 if let Ok(mut g) = orch.lock() {
                                     g.starting.insert(name.to_string());
+                                    g.root_pids.insert(name.to_string(), root_pid as i32);
                                 }
                                 (OUTCOME_SUCCESS, REASON_NA)
                             }
@@ -1100,6 +1216,7 @@ fn dispatch_ipc(
                     if let Ok(mut g) = orch.lock() {
                         g.running.remove(name);
                         g.starting.remove(name);
+                        g.root_pids.remove(name);
                     }
                     info!(
                         "[SYSX] ORACLE_DFS_UNLINK_COMPLETE service={} (AlreadyGone)",
@@ -1121,6 +1238,7 @@ fn dispatch_ipc(
                     if let Ok(mut g) = orch.lock() {
                         g.running.remove(name);
                         g.starting.remove(name);
+                        g.root_pids.remove(name);
                     }
                     info!(
                         "[SYSX] ORACLE_DFS_UNLINK_COMPLETE service={} (Dead)",
@@ -1139,6 +1257,7 @@ fn dispatch_ipc(
                     if let Ok(mut g) = orch.lock() {
                         g.running.remove(name);
                         g.starting.remove(name);
+                        g.root_pids.remove(name);
                     }
                     (OUTCOME_TOMBSTONED, REASON_NA)
                 }
@@ -1270,6 +1389,7 @@ fn try_spawn_ready_services(
             .map(|g| {
                 g.running.contains(name)
                     || g.starting.contains(name)
+                    || g.recovering.contains(name)
                     || g.cascade_failed.contains(name)
             })
             .unwrap_or(true);
@@ -1342,7 +1462,11 @@ fn spawn_service_for_orchestration(
     }
     if orch
         .lock()
-        .map(|g| g.running.contains(name) || g.starting.contains(name))
+        .map(|g| {
+            g.running.contains(name)
+                || g.starting.contains(name)
+                || g.recovering.contains(name)
+        })
         .unwrap_or(true)
     {
         return Err("already running or starting".into());
@@ -1353,7 +1477,10 @@ fn spawn_service_for_orchestration(
     if let Ok(mut g) = dfs_proven_dead.lock() {
         g.remove(name);
     }
-    let SpawnOutcome { readiness_read } = outcome;
+    let SpawnOutcome {
+        readiness_read,
+        root_pid,
+    } = outcome;
     let rfd = readiness_read.as_raw_fd();
     let ev = EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP, rfd as u64);
     let mut m = readiness_files
@@ -1366,6 +1493,7 @@ fn spawn_service_for_orchestration(
     drop(m);
     if let Ok(mut g) = orch.lock() {
         g.starting.insert(name.to_string());
+        g.root_pids.insert(name.to_string(), root_pid as i32);
     }
     info!("orchestration spawned service={} (awaiting FD3)", name);
     Ok(())
@@ -1383,6 +1511,7 @@ fn handle_readiness_fd(
     dag: &Arc<DagRuntime>,
     orch: &Arc<Mutex<OrchestratorState>>,
     autotest_stop_after_readiness: &Option<String>,
+    recovery_pending: &Arc<Mutex<HashMap<String, std::fs::File>>>,
 ) -> Result<(), SysXError> {
     use std::os::unix::io::AsFd;
 
@@ -1407,6 +1536,16 @@ fn handle_readiness_fd(
                 f
             };
             let _ = epoll.delete(file.as_fd());
+            if let Ok(mut g) = orch.lock() {
+                g.root_pids.remove(&name);
+            }
+            let oom_kill = match rt.memory_events_path(&name) {
+                Ok(p) => read_sysfs_memory_oom_kill_nonzero(&p).unwrap_or(false),
+                Err(_) => false,
+            };
+            if oom_kill {
+                info!("[SYSX] ORACLE_OOM_KILL service={}", name);
+            }
             let was_starting = orch
                 .lock()
                 .map(|mut g| {
@@ -1416,7 +1555,62 @@ fn handle_readiness_fd(
                 })
                 .unwrap_or((false, false));
             if was_starting.0 && !was_starting.1 {
-                record_service_failed(&name, dag, orch);
+                let policy = schemas.get(&name).and_then(|s| s.recovery.as_ref());
+                if recovery_applies(policy) {
+                    let pol = policy.expect("recovery_applies implies policy");
+                    let now = Instant::now();
+                    let trip = {
+                        let mut g = orch.lock().map_err(|e| {
+                            SysXError::Reactor(format!("orch lock: {}", e))
+                        })?;
+                        let events = g.restart_events.entry(name.clone()).or_default();
+                        events.push(now);
+                        prune_restart_window(events, pol.window_sec, now);
+                        circuit_should_open(events, pol.max_restarts)
+                    };
+                    if trip {
+                        if let Ok(mut g) = orch.lock() {
+                            g.circuit_origin.insert(name.clone());
+                        }
+                        propagate_cascade_failure(&name, dag, orch);
+                        return Ok(());
+                    }
+                    let (exp, ms) = {
+                        let mut g = orch.lock().map_err(|e| {
+                            SysXError::Reactor(format!("orch lock: {}", e))
+                        })?;
+                        let exp = *g.recovery_generation.entry(name.clone()).or_insert(0);
+                        g.recovery_generation
+                            .insert(name.clone(), exp.saturating_add(1));
+                        g.recovering.insert(name.clone());
+                        let ms = backoff_exponential_ms(pol.backoff_ms, exp);
+                        (exp, ms)
+                    };
+                    info!(
+                        "[SYSX] RECOVERY_SCHEDULE service={} exp={} backoff_ms={} (Phase 4)",
+                        name, exp, ms
+                    );
+                    let mut pm = recovery_pending.lock().map_err(|e| {
+                        SysXError::Reactor(format!("recovery_pending: {}", e))
+                    })?;
+                    if let Some(old) = pm.remove(&name) {
+                        let _ = epoll.delete(old.as_fd());
+                    }
+                    drop(pm);
+                    let tf = recovery_timerfd_arm_ms(ms).map_err(|e| {
+                        SysXError::Reactor(format!("recovery_timerfd: {}", e))
+                    })?;
+                    let ev = EpollEvent::new(EpollFlags::EPOLLIN, tf.as_raw_fd() as u64);
+                    epoll.add(&tf, ev).map_err(|e| {
+                        SysXError::Reactor(format!("epoll add recovery timer: {}", e))
+                    })?;
+                    recovery_pending
+                        .lock()
+                        .map_err(|e| SysXError::Reactor(format!("recovery_pending: {}", e)))?
+                        .insert(name.clone(), tf);
+                } else {
+                    record_service_failed(&name, dag, orch);
+                }
             }
         }
         Ok(n) if n > 0 => {
@@ -1433,6 +1627,8 @@ fn handle_readiness_fd(
                 if let Ok(mut g) = orch.lock() {
                     g.starting.remove(&name);
                     g.running.insert(name.clone());
+                    g.recovery_generation.remove(&name);
+                    g.restart_events.remove(&name);
                 }
                 try_spawn_ready_services(
                     rt,
@@ -1478,6 +1674,7 @@ fn autotest_stop_after_readiness_fire(
             if let Ok(mut g) = orch.lock() {
                 g.running.remove(name);
                 g.starting.remove(name);
+                g.root_pids.remove(name);
             }
             info!(
                 "[SYSX] ORACLE_DFS_UNLINK_COMPLETE service={} (autotest stop)",
@@ -1491,6 +1688,7 @@ fn autotest_stop_after_readiness_fire(
             let _ = orch.lock().map(|mut g| {
                 g.running.remove(name);
                 g.starting.remove(name);
+                g.root_pids.remove(name);
             });
             info!(
                 "[SYSX] ORACLE_AUTOTEST_STOP_TOMBSTONED service={}",

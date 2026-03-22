@@ -237,6 +237,37 @@ def phase_musl_build(sysx_root: Path) -> bool:
     return False
 
 
+def compile_hostile_payloads(sysx_root: Path, dest_bin: Path) -> None:
+    """Compile Phase 4 hostile oracle binaries into dest_bin (best-effort if gcc exists)."""
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    dest_bin.mkdir(parents=True, exist_ok=True)
+    if not gcc:
+        print("[WARN] gcc/cc not found; skipping hostile payload compile (Phase 4)")
+        return
+    src_dir = sysx_root / "tools" / "payloads"
+    mapping = (
+        ("oracle_oom.c", "oracle_oom"),
+        ("oracle_forkbomb.c", "oracle_forkbomb"),
+        ("oracle_defiant.c", "oracle_defiant"),
+    )
+    for cfile, out in mapping:
+        sp = src_dir / cfile
+        if not sp.is_file():
+            print(f"[WARN] missing {sp}")
+            continue
+        outpath = dest_bin / out
+        r = subprocess.run(
+            [gcc, "-O2", "-static", "-s", "-o", str(outpath), str(sp)],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            print(f"[WARN] compile {cfile} failed: {r.stderr}")
+            continue
+        outpath.chmod(0o755)
+        print(f"[SUCCESS] hostile payload {outpath.name}")
+
+
 def phase_initramfs_layout(sysx_root: Path, build_dir: Path) -> bool:
     """Phase 2: Forge initramfs layout."""
     print("\n=== PHASE 2: INITRAMFS LAYOUT ===")
@@ -288,6 +319,58 @@ depends_on: []
 """
     )
 
+    compile_hostile_payloads(sysx_root, rootfs / "bin")
+
+    (schemas_dir / "oracle_oom.yaml").write_text(
+        """sysx_version: 1
+enabled: false
+service:
+  name: oracle_oom
+  exec: /bin/oracle_oom
+  args: []
+  env: {}
+  user: "0"
+type: simple
+depends_on: []
+memory:
+  max_mb: 32
+  swap_mb: 0
+recovery:
+  policy: on_failure
+  backoff_ms: 200
+  max_restarts: 5
+  window_sec: 60
+"""
+    )
+    (schemas_dir / "oracle_forkbomb.yaml").write_text(
+        """sysx_version: 1
+enabled: false
+service:
+  name: oracle_forkbomb
+  exec: /bin/oracle_forkbomb
+  args: []
+  env: {}
+  user: "0"
+type: simple
+depends_on: []
+pids:
+  max: 64
+"""
+    )
+    (schemas_dir / "oracle_defiant.yaml").write_text(
+        """sysx_version: 1
+enabled: false
+service:
+  name: oracle_defiant
+  exec: /bin/oracle_defiant
+  args: []
+  env: {}
+  user: "0"
+type: simple
+depends_on: []
+"""
+    )
+
     print(f"[SUCCESS] Initramfs layout forged at {rootfs}")
     return True
 
@@ -301,6 +384,7 @@ def phase_qemu_headless(
     oracle_strict: bool = False,
     dual_oracle_strict: bool = False,
     test0_strict: bool = False,
+    hostile_strict: bool = False,
     autotest_service: str = "baseline",
 ) -> bool:
     """Phase 3: Pack initramfs; optionally run QEMU with kernel bzImage."""
@@ -371,22 +455,28 @@ def phase_qemu_headless(
         ok_s = verify_serial_oracle(serial, strict=oracle_strict)
         ok_d = verify_dual_oracle(serial, strict=dual_oracle_strict)
         ok_t0 = verify_test0_oracle(serial, service=autotest_service, strict=test0_strict)
+        ok_h = verify_hostile_markers(serial, strict=hostile_strict)
         if oracle_strict and not ok_s:
             return False
         if dual_oracle_strict and not ok_d:
             return False
         if test0_strict and not ok_t0:
             return False
+        if hostile_strict and not ok_h:
+            return False
         return True
     serial = (r.stdout or "") + (r.stderr or "")
     ok_s = verify_serial_oracle(serial, strict=oracle_strict)
     ok_d = verify_dual_oracle(serial, strict=dual_oracle_strict)
     ok_t0 = verify_test0_oracle(serial, service=autotest_service, strict=test0_strict)
+    ok_h = verify_hostile_markers(serial, strict=hostile_strict)
     if oracle_strict and not ok_s:
         return False
     if dual_oracle_strict and not ok_d:
         return False
     if test0_strict and not ok_t0:
+        return False
+    if hostile_strict and not ok_h:
         return False
     print(f"[INFO] QEMU exited with code {r.returncode}")
     return True
@@ -403,6 +493,9 @@ _ORACLE_MARKERS_REQUIRED = (
 # Phase 3 — FD3 readiness + DFS unlink (hypervisor Test 0).
 _TEST0_READINESS = "[SYSX] ORACLE_READINESS"
 _TEST0_DFS = "[SYSX] ORACLE_DFS_UNLINK_COMPLETE"
+
+# Phase 4 — hostile QEMU profiles (enable schemas + matching sysx.autotest=stop:<svc>).
+_HOSTILE_OOM = "[SYSX] ORACLE_OOM_KILL"
 
 # `11` § Test 0 / dual-oracle — lines emitted by sysxd `reactor.rs` after IPC dispatch.
 _ORACLE_DUAL_RE = re.compile(
@@ -484,6 +577,19 @@ def verify_serial_oracle(serial_text: str, strict: bool = False) -> bool:
     return True
 
 
+def verify_hostile_markers(serial_text: str, strict: bool = False) -> bool:
+    """Phase 4: optional serial proof lines (OOM path, defiant stop uses Test0 DFS markers)."""
+    if _HOSTILE_OOM not in serial_text:
+        msg = f"[ORACLE] Phase 4 hostile: missing {_HOSTILE_OOM!r} (enable oracle_oom + memory limit)"
+        if strict:
+            print(msg, file=sys.stderr)
+            return False
+        print(f"{msg} (non-strict: continue)")
+        return True
+    print("[ORACLE] Phase 4 hostile OOM marker present")
+    return True
+
+
 def verify_test0_oracle(serial_text: str, service: str = "baseline", strict: bool = False) -> bool:
     """Phase 3 Test 0: FD3 readiness then DFS post-order unlink complete (`sysx.autotest=stop:<svc>`)."""
     ok_r = _TEST0_READINESS in serial_text and f"service={service}" in serial_text
@@ -551,6 +657,11 @@ def main():
         default="baseline",
         help="Kernel cmdline sysx.autotest=stop:<name> (default baseline)",
     )
+    parser.add_argument(
+        "--hostile-strict",
+        action="store_true",
+        help="Fail if Phase 4 [SYSX] ORACLE_OOM_KILL missing in QEMU serial (hostile profile)",
+    )
     args = parser.parse_args()
 
     args.build_dir.mkdir(parents=True, exist_ok=True)
@@ -574,6 +685,7 @@ def main():
             oracle_strict=args.oracle_strict,
             dual_oracle_strict=args.dual_oracle_strict,
             test0_strict=args.test0_strict,
+            hostile_strict=args.hostile_strict,
             autotest_service=args.autotest_service,
         )
 

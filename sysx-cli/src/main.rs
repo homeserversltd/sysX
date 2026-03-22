@@ -134,5 +134,14 @@ fn explain_status_abi(b0: u8, b1: u8) -> String {
         0x07 => "Recovering",
         _ => "Unknown(primary)",
     };
-    format!("  state: {} (byte0=0x{:02x} byte1=0x{:02x})", state, b0, b1)
+    let reason = match b1 {
+        0x00 => "none",
+        0x01 => "Orphaned",
+        0x05 => "CircuitOpen",
+        _ => "other",
+    };
+    format!(
+        "  state: {} (byte0=0x{:02x}) reason: {} (byte1=0x{:02x})",
+        state, b0, reason, b1
+    )
 }

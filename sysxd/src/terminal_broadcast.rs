@@ -3,10 +3,21 @@
 //! Shared path for **`Command::Poweroff`** (`0x50`), **`Command::Reboot`** (`0x60`), and **`SIGPWR`**
 //! (ACPI / kernel power path). Step 6 uses **`sync(2)`** then **`reboot(2)`** when PID 1 and
 //! **`SYSX_SKIP_REBOOT`** is unset; otherwise logs a clear stub (`12` §9.1, `17` kernel-first policy).
+//!
+//! ## Red-team: `cgroup.procs` vs in-memory root PID (`Phase 4`)
+//!
+//! Reading **`/sys/fs/cgroup/.../cgroup.procs`** during phase 1 can stall PID 1 when a workload has
+//! spawned a huge thread count (`O(n)` kernel work). **Mitigation:** **`OrchestratorState.root_pids`**
+//! stores the **immediate child PID** from **`std::process::Command::spawn`** (same as logged
+//! **`child_pid=`** in **`service_spawn`**). That PID is the process **`execve`** target after
+//! **`cgroup.procs`** self-join in **`pre_exec`**; **`libc::kill(root_pid, SIGTERM)`** is **`O(1)`**
+//! with no cgroup filesystem walk. Phase 1 iterates **`running`** and uses **`root_pids.get(name)`**
+//! only.
 
 use std::fs;
-use std::io::{self, ErrorKind};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -18,8 +29,9 @@ use nix::unistd::Pid;
 #[cfg(target_os = "linux")]
 use nix::sys::signalfd::{SignalFd, SfdFlags};
 
-use sysx_runtime::{read_sysfs_cgroup_populated, validate_service_id, RuntimeContext};
+use sysx_runtime::RuntimeContext;
 
+use crate::orchestration::OrchestratorState;
 use crate::SysXError;
 
 /// Final syscall for `12` §9.1 step 6.
@@ -67,68 +79,32 @@ fn should_try_reboot() -> bool {
     true
 }
 
-fn read_cgroup_pids(path: &Path) -> Vec<i32> {
-    match fs::read_to_string(path) {
-        Ok(s) => s
-            .lines()
-            .filter_map(|l| l.trim().parse::<i32>().ok())
-            .collect(),
-        Err(e) if e.kind() == ErrorKind::NotFound => vec![],
+fn phase1_sigterm_running_services(orch: &Arc<Mutex<OrchestratorState>>) {
+    let names: Vec<String> = match orch.lock() {
+        Ok(g) => g.running.iter().cloned().collect(),
         Err(e) => {
-            error!("read cgroup.procs {}: {}", path.display(), e);
-            vec![]
-        }
-    }
-}
-
-fn phase1_sigterm_running_services(rt: &RuntimeContext, slice: &Path) {
-    let entries = match fs::read_dir(slice) {
-        Ok(e) => e,
-        Err(e) => {
-            error!("read_dir {}: {}", slice.display(), e);
+            error!("§9.1 phase 1: orch lock: {}", e);
             return;
         }
     };
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
-        if !ft.is_dir() {
-            continue;
-        }
-        let name = match entry.file_name().into_string() {
-            Ok(s) => s,
+    for name in names {
+        let pid = match orch.lock() {
+            Ok(g) => g.root_pids.get(&name).copied(),
             Err(_) => continue,
         };
-        if validate_service_id(&name).is_err() {
+        let Some(root_pid) = pid else {
+            warn!(
+                "§9.1 phase 1: service {} in running set but no root_pid — skip SIGTERM",
+                name
+            );
             continue;
-        }
-        let events_path = match rt.cgroup_events_path(&name) {
-            Ok(p) => p,
-            Err(_) => continue,
         };
-        match read_sysfs_cgroup_populated(&events_path) {
-            Ok(Some(true)) => {
-                let procs_path = slice.join(&name).join("cgroup.procs");
-                let pids = read_cgroup_pids(&procs_path);
-                if pids.is_empty() {
-                    info!(
-                        "§9.1 phase 1: service {} populated=1 but cgroup.procs empty — skip SIGTERM",
-                        name
-                    );
-                    continue;
-                }
-                let root_pid = *pids.iter().min().expect("nonempty pids");
-                info!(
-                    "§9.1 phase 1: service {} root_pid={} → SIGTERM (12 §9.1)",
-                    name, root_pid
-                );
-                if let Err(e) = kill(Pid::from_raw(root_pid), Signal::SIGTERM) {
-                    error!("kill SIGTERM pid {} (service {}): {}", root_pid, name, e);
-                }
-            }
-            Ok(Some(false)) | Ok(None) => {}
-            Err(e) => error!("read cgroup.events {}: {}", events_path.display(), e),
+        info!(
+            "§9.1 phase 1: service {} root_pid={} → SIGTERM (12 §9.1, O(1))",
+            name, root_pid
+        );
+        if let Err(e) = kill(Pid::from_raw(root_pid), Signal::SIGTERM) {
+            error!("kill SIGTERM pid {} (service {}): {}", root_pid, name, e);
         }
     }
 }
@@ -143,7 +119,13 @@ fn phase_global_cgroup_kill(slice: &Path) -> io::Result<()> {
 }
 
 /// `12` §9.1 Terminal Broadcast — strict order: grace SIGTERM → 5000 ms → global freeze/kill/unfreeze → sync → reboot.
-pub fn run_terminal_broadcast(rt: &RuntimeContext, kind: TerminalBroadcastKind, trigger: &str) {
+/// **No DFS** unlink on this path (`Phase 4`).
+pub fn run_terminal_broadcast(
+    rt: &RuntimeContext,
+    kind: TerminalBroadcastKind,
+    trigger: &str,
+    orch: &Arc<Mutex<OrchestratorState>>,
+) {
     info!(
         "Terminal Broadcast (12 §9.1) start trigger={} kind={:?} slice={}",
         trigger,
@@ -160,10 +142,10 @@ pub fn run_terminal_broadcast(rt: &RuntimeContext, kind: TerminalBroadcastKind, 
     }
 
     info!(
-        "§9.1 phase 1: SIGTERM to root PID of each Running service under {}",
+        "§9.1 phase 1: SIGTERM to root PID of each Running service (in-memory map) {}",
         slice.display()
     );
-    phase1_sigterm_running_services(rt, &slice);
+    phase1_sigterm_running_services(orch);
 
     info!("§9.1 phase 2: synchronous grace 5000 ms (hardcoded, 12 §9.1)");
     thread::sleep(Duration::from_millis(5000));
@@ -203,7 +185,7 @@ pub fn run_terminal_broadcast(rt: &RuntimeContext, kind: TerminalBroadcastKind, 
 
 /// Drain pending **`SIGPWR`** frames from **`signalfd`**, then run the same halt path as **`0x50`** (`12` §9.1).
 #[cfg(target_os = "linux")]
-pub fn on_sigpwr_signalfd(sfd: &SignalFd, rt: &RuntimeContext) {
+pub fn on_sigpwr_signalfd(sfd: &SignalFd, rt: &RuntimeContext, orch: &Arc<Mutex<OrchestratorState>>) {
     let mut n = 0usize;
     loop {
         match sfd.read_signal() {
@@ -224,19 +206,23 @@ pub fn on_sigpwr_signalfd(sfd: &SignalFd, rt: &RuntimeContext) {
         "SIGPWR: drained {} signalfd frame(s) — Terminal Broadcast halt path (12 §9.1)",
         n
     );
-    run_terminal_broadcast(rt, TerminalBroadcastKind::Poweroff, "sigpwr");
+    run_terminal_broadcast(rt, TerminalBroadcastKind::Poweroff, "sigpwr", orch);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
-    fn read_cgroup_pids_parses_lines() {
-        let tmp = std::env::temp_dir().join("sysx_tb_test_procs");
-        fs::write(&tmp, b"12\n34\n").unwrap();
-        let p = read_cgroup_pids(&tmp);
-        assert_eq!(p, vec![12, 34]);
-        let _ = fs::remove_file(&tmp);
+    fn phase1_uses_root_pid_map() {
+        let orch = Arc::new(Mutex::new(OrchestratorState {
+            running: HashSet::from(["a".into()]),
+            root_pids: [("a".into(), 4242)].into_iter().collect(),
+            ..OrchestratorState::default()
+        }));
+        let _rt = RuntimeContext::default();
+        // Does not panic; kill may fail for nonexistent PID (logged).
+        phase1_sigterm_running_services(&orch);
     }
 }

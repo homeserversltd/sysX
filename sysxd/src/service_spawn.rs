@@ -48,8 +48,10 @@ use sysx_runtime::RuntimeContext;
 use nix::mount::{mount, MsFlags};
 
 /// Parent-held readiness pipe read end — register on **`epoll`** in **`sysxd`**.
+/// **`root_pid`** is the PID of the child after **`spawn`** (immediate **`execve`** target); used for O(1) **`SIGTERM`** in **`12` §9.1`.
 pub struct SpawnOutcome {
     pub readiness_read: std::fs::File,
+    pub root_pid: u32,
 }
 
 fn clear_fd_cloexec(fd: RawFd) {
@@ -534,13 +536,17 @@ pub fn spawn_simple_service(rt: &RuntimeContext, schema: &ServiceSchema) -> io::
         Ok(ch) => {
             let _ = close(pipe_w);
             let readiness_read = unsafe { std::fs::File::from_raw_fd(pipe_r) };
+            let root_pid = ch.id();
             info!(
                 "spawned service={} child_pid={} exec={}",
                 schema.service.name,
-                ch.id(),
+                root_pid,
                 schema.service.exec
             );
-            Ok(SpawnOutcome { readiness_read })
+            Ok(SpawnOutcome {
+                readiness_read,
+                root_pid,
+            })
         }
         Err(e) => {
             let _ = close(pipe_r);

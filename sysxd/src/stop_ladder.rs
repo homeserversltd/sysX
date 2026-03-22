@@ -164,6 +164,7 @@ fn maybe_umount_proc_detach(_svc: &Path, name: &str) {
 }
 
 /// Wait until **`populated=0`** or deadline — uses **`poll(2)`** on **`cgroup.events`** when possible (`11` / `12` §4.1).
+/// (Spec text says “epoll wait”; synchronous **`stop_service`** uses **`poll`** on the same file for wake-on-update.)
 fn wait_populated_zero_pollable(
     events_path: &Path,
     name: &str,
